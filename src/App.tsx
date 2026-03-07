@@ -8,8 +8,8 @@ import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
-import { FolderOpen, Video, Music, Play, Square, Pause, Settings, CheckCircle, XCircle, ExternalLink, Volume2, VolumeX } from "lucide-react";
-import type { MediaFile, ConversionProgress, AppSettings, ScanResult, ScanProgress, ConversionCompleteEvent, ConversionCancelledEvent } from "@/types";
+import { FolderOpen, Video, Music, Play, Square, Pause, Settings, CheckCircle, XCircle, ExternalLink, Volume2, VolumeX, AlertTriangle } from "lucide-react";
+import type { MediaFile, ConversionProgress, AppSettings, ScanResult, ScanProgress, ConversionCompleteEvent, ConversionCancelledEvent, IntegrityValidation } from "@/types";
 import { formatFileSize, formatTime } from "@/lib/utils";
 import { createThrottledState } from "@/hooks/useThrottle";
 import { useVirtualList } from "@/hooks/useVirtualList";
@@ -63,6 +63,8 @@ function App() {
   const [showOpenFolderDialog, setShowOpenFolderDialog] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [integrityValidations, setIntegrityValidations] = useState<IntegrityValidation[]>([]);
+  const [showIntegrityDialog, setShowIntegrityDialog] = useState(false);
 
   // Core functions that need to be defined before their dependencies
   const scanFolder = useCallback(async (path: string) => {
@@ -395,16 +397,31 @@ function App() {
       setIsPaused(false);
     });
 
+    // Listen for integrity validation events
+    const unlistenIntegrity = listen<IntegrityValidation>("conversion-integrity", (event) => {
+      const validation = event.payload;
+      setIntegrityValidations(prev => [...prev, validation]);
+      
+      if (!validation.is_valid) {
+        toast.error(`文件完整性校验失败: ${validation.file_id}`, {
+          description: validation.validation_details.join(", "),
+        });
+      } else {
+        toast.success(`文件完整性校验通过: ${validation.file_id}`);
+      }
+    });
+
     // Properly cleanup event listeners and intervals
     return () => {
       clearInterval(flushInterval);
-      Promise.all([unlistenProgress, unlistenScanProgress, unlistenComplete, unlistenPaused, unlistenResumed])
-        .then(([fn1, fn2, fn3, fn4, fn5]) => {
+      Promise.all([unlistenProgress, unlistenScanProgress, unlistenComplete, unlistenPaused, unlistenResumed, unlistenIntegrity])
+        .then(([fn1, fn2, fn3, fn4, fn5, fn6]) => {
           fn1?.();
           fn2?.();
           fn3?.();
           fn4?.();
           fn5?.();
+          fn6?.();
         })
         .catch((err) => {
           console.error("Error cleaning up listeners:", err);
@@ -676,16 +693,30 @@ function App() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 max-h-60 overflow-y-auto">
-            {completeEvent?.results.map((result, idx) => (
-              <div key={idx} className="flex items-center gap-2 text-sm">
-                {result.success ? (
-                  <CheckCircle className="w-4 h-4 text-[#10B981]" />
-                ) : (
-                  <XCircle className="w-4 h-4 text-[#EF4444]" />
-                )}
-                <span className="flex-1 truncate">{result.file_id}</span>
-              </div>
-            ))}
+            {completeEvent?.results.map((result, idx) => {
+              // Find integrity validation for this file
+              const validation = integrityValidations.find(v => v.file_id === result.file_id);
+              const hasIssues = validation && !validation.is_valid;
+              
+              return (
+                <div key={idx} className="flex items-center gap-2 text-sm">
+                  {result.success ? (
+                    <CheckCircle className="w-4 h-4 text-[#10B981]" />
+                  ) : (
+                    <XCircle className="w-4 h-4 text-[#EF4444]" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <p className="truncate">{result.file_id}</p>
+                    {hasIssues && (
+                      <p className="text-[10px] text-[#EF4444] truncate flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                        校验失败
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setShowCompleteDialog(false)}>

@@ -11,6 +11,18 @@ use tokio::sync::Mutex;
 mod converter;
 mod scanner;
 
+pub use converter::IntegrityValidation;
+
+/// Integrity validation result for converted files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityValidation {
+    pub file_id: String,
+    pub is_valid: bool,
+    pub validation_details: Vec<String>,
+    pub file_size: u64,
+    pub expected_size: Option<u64>,
+}
+
 /// Generate a simple timestamp in format: YYYY-MM-DD HH:MM:SS
 fn chrono_lite_timestamp() -> String {
     let now = std::time::SystemTime::now()

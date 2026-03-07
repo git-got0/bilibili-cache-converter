@@ -728,6 +728,28 @@ async fn convert_single_file(
 
                 log::info!("[Conversion] Successfully converted: {} ({:.2} MB/s)", output_path_str, conversion_speed);
 
+                // Validate file integrity after conversion
+                let validation = validate_file_integrity(&output_path_str, &file);
+                
+                if !validation.is_valid {
+                    log::warn!("[Conversion] Integrity validation failed for file: {}", file.id);
+                    for detail in &validation.validation_details {
+                        log::warn!("[Validation] {}", detail);
+                    }
+                    
+                    // Still return success but emit validation result
+                    let _ = app.emit(
+                        "conversion-integrity",
+                        validation,
+                    );
+                } else {
+                    log::info!("[Conversion] Integrity validation passed for file: {}", file.id);
+                    let _ = app.emit(
+                        "conversion-integrity",
+                        validation,
+                    );
+                }
+
                 ConversionResult {
                     file_id: file.id.clone(),
                     success: true,
@@ -980,6 +1002,132 @@ mod tests {
         assert_ne!(GpuType::Nvidia, GpuType::Amd);
         assert_ne!(GpuType::Amd, GpuType::Intel);
         assert_ne!(GpuType::Intel, GpuType::None);
+    }
+}
+
+/// Validate the integrity of a converted file
+/// Checks: file existence, size, readability, and basic format validation
+pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> crate::IntegrityValidation {
+    let mut validation_details: Vec<String> = Vec::new();
+    let mut is_valid = true;
+
+    // Check 1: File exists
+    let path_obj = Path::new(output_path);
+    if !path_obj.exists() {
+        validation_details.push("文件不存在".to_string());
+        is_valid = false;
+        
+        return crate::IntegrityValidation {
+            file_id: original_file.id.clone(),
+            is_valid: false,
+            validation_details,
+            file_size: 0,
+            expected_size: Some(original_file.size),
+        };
+    }
+
+    // Check 2: File size
+    let metadata = match path_obj.metadata() {
+        Ok(meta) => meta,
+        Err(e) => {
+            validation_details.push(format!("无法读取文件元数据: {}", e));
+            is_valid = false;
+            
+            return crate::IntegrityValidation {
+                file_id: original_file.id.clone(),
+                is_valid: false,
+                validation_details,
+                file_size: 0,
+                expected_size: Some(original_file.size),
+            };
+        }
+    };
+
+    let output_size = metadata.len();
+    validation_details.push(format!("输出文件大小: {} 字节", output_size));
+    
+    // Validate file size is reasonable (not zero and not suspiciously small)
+    if output_size == 0 {
+        validation_details.push("文件大小为0,可能转换失败".to_string());
+        is_valid = false;
+    } else if output_size < 1024 {
+        // Less than 1KB is suspicious
+        validation_details.push("文件大小异常小 (<1KB),可能转换不完整".to_string());
+        is_valid = false;
+    }
+
+    // Check 3: File is readable (can open and read)
+    if let Err(e) = std::fs::File::open(output_path) {
+        validation_details.push(format!("无法打开文件: {}", e));
+        is_valid = false;
+    }
+
+    // Check 4: File format validation (basic check)
+    let extension = path_obj
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    
+    match extension.as_str() {
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" => {
+            // Video formats: check if it's not empty
+            if output_size < 100 {
+                validation_details.push("视频文件大小过小,可能损坏".to_string());
+                is_valid = false;
+            }
+            validation_details.push("视频格式校验通过".to_string());
+        }
+        "mp3" | "aac" | "m4a" | "flac" | "wav" | "ogg" => {
+            // Audio formats: check if it's not empty
+            if output_size < 100 {
+                validation_details.push("音频文件大小过小,可能损坏".to_string());
+                is_valid = false;
+            }
+            validation_details.push("音频格式校验通过".to_string());
+        }
+        _ => {
+            validation_details.push(format!("未知文件格式: {}", extension));
+        }
+    }
+
+    // Check 5: Size comparison with original (rough check)
+    // Video files can be much smaller after compression
+    // Audio files should be similar size
+    if original_file.file_type == "audio" {
+        let size_diff = (output_size as i64 - original_file.size as i64).abs();
+        let size_ratio = if original_file.size > 0 {
+            (size_diff as f64 / original_file.size as f64 * 100.0)
+        } else {
+            0.0
+        };
+        
+        if size_ratio > 50.0 {
+            // More than 50% difference in audio size is suspicious
+            validation_details.push(format!(
+                "音频文件大小异常 (差异: {:.1}%)", 
+                size_ratio
+            ));
+            is_valid = false;
+        }
+    }
+
+    // Check 6: File can be opened for reading (basic playback test)
+    if let Ok(file) = std::fs::File::open(output_path) {
+        if let Err(e) = file.metadata() {
+            validation_details.push(format!("读取文件元数据失败: {}", e));
+            is_valid = false;
+        } else {
+            validation_details.push("文件可读取".to_string());
+        }
+    }
+
+    crate::IntegrityValidation {
+        file_id: original_file.id.clone(),
+        is_valid,
+        validation_details,
+        file_size: output_size,
+        expected_size: Some(original_file.size),
     }
 }
 

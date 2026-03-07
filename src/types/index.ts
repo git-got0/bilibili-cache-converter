@@ -32,6 +32,14 @@ export interface ConversionResult {
   error: string | null;
 }
 
+export interface IntegrityValidation {
+  file_id: string;
+  is_valid: boolean;
+  validation_details: string[];
+  file_size: number;
+  expected_size: number | null;
+}
+
 export interface ScanResult {
   files: MediaFile[];
   total_size: number;
