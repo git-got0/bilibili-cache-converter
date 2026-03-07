@@ -24,8 +24,12 @@ const FileItem = React.memo(({ file }: { file: MediaFile }) => (
       <Music className="w-3 h-3 text-[#8B5CF6] flex-shrink-0" />
     )}
     <div className="flex-1 min-w-0">
-      <p className="text-xs truncate">{file.title}</p>
-      <p className="text-[10px] text-[#8B949E] truncate">{file.name}</p>
+      <p className="text-xs truncate" title={file.title}>
+        {file.title || file.name}
+      </p>
+      <p className="text-[10px] text-[#8B949E] truncate" title={file.path}>
+        {file.path}
+      </p>
     </div>
     <span className="text-[10px] text-[#8B949E] flex-shrink-0 ml-1">{formatFileSize(file.size)}</span>
   </div>
@@ -580,7 +584,11 @@ function App() {
         {isConverting && progress && (
           <div className="bg-[#21262D]/80 backdrop-blur-sm rounded-lg p-2 border border-[#30363D]/50 flex-shrink-0">
             <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs truncate flex-1 mr-2">{progress.file_name}</span>
+              <span className="text-xs truncate flex-1 mr-2" title={progress.file_name}>
+                {progress.file_name.length > 50 ?
+                  progress.file_name.substring(0, 50) + '...' :
+                  progress.file_name}
+              </span>
               <span className="text-xs text-[#8B949E] whitespace-nowrap">
                 {progress.current_index + 1} / {progress.total_count}
               </span>
