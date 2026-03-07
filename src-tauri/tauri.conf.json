@@ -1,0 +1,55 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config_schema.json",
+  "productName": "Bilibili缓存转换器",
+  "version": "1.0.0",
+  "identifier": "com.bilibili.converter",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Bilibili缓存转换器",
+        "width": 900,
+        "height": 650,
+        "minWidth": 600,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.ico",
+      "iconAsTemplate": false
+    },
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: asset: https://asset.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/*": "./"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

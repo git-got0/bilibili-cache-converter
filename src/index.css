@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Microsoft YaHei', 'PingFang-SC', sans-serif;
+  background: linear-gradient(135deg, #0D1117 0%, #161B22 100%);
+  min-height: 100vh;
+  color: #FFFFFF;
+  overflow: hidden;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #21262D;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #00D9FF;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #8B5CF6;
+}
