@@ -846,9 +846,10 @@ fn calculate_time_stats(
 /// Example: download/v/video.blv -> output to download/result/video.mp4 (skip "v")
 /// But: download/v1/video1/blv -> output to download/result/v1/video1.mp4 (keep structure)
 /// Extended: download/a/b/video.blv -> output to download/result/video.mp4 (skip both "a" and "b" if each has only one subfolder)
+/// IMPORTANT: Always preserve at least the first level (sub-top level directory)
 fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf {
     if relative_dir.components().count() <= 1 {
-        // No subdirectory or only one level, keep as is
+        // No subdirectory or only one level, keep as is (this IS the sub-top level)
         return relative_dir.to_path_buf();
     }
 
@@ -856,10 +857,20 @@ fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf 
     let mut result_path = relative_dir.to_path_buf();
     let mut current_base = base_path.to_path_buf();
 
-    // Try to skip up to 3 levels of single subfolder (original 1 + 2 more)
-    let max_levels_to_skip = 3;
+    // Count the original levels to ensure we preserve at least the first one
+    let original_components: Vec<_> = relative_dir.components().collect();
+    let original_level_count = original_components.len();
 
-    for _ in 0..max_levels_to_skip {
+    // Only try to skip if we have more than 1 level (need to preserve at least level 0)
+    // We can skip levels 1, 2, etc., but never level 0
+    let max_levels_to_skip = original_level_count.saturating_sub(1).min(3);
+
+    for skip_level in 0..max_levels_to_skip {
+        // Ensure we never skip level 0 (the first directory after base_dir)
+        if skip_level >= original_level_count {
+            break;
+        }
+
         // Get the first component of the current result path
         let components: Vec<_> = result_path.components().collect();
         if components.is_empty() {
@@ -877,13 +888,13 @@ fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf 
                 .filter(|e| e.path().is_dir())
                 .collect();
 
-            if subdirs.len() == 1 {
+            if subdirs.len() == 1 && components.len() > 1 {
                 // Skip this level and continue checking the next
                 result_path = components[1..].iter().collect();
                 current_base = check_path;
                 log::info!("Optimizing path: skipping single subfolder '{}'", display_name);
             } else {
-                // No more single subfolders to skip
+                // No more single subfolders to skip, or this is the last level
                 break;
             }
         } else {

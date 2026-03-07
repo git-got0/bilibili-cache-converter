@@ -1,7 +1,6 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import * as dialog from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -60,7 +59,6 @@ function App() {
   const [showOpenFolderDialog, setShowOpenFolderDialog] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const fileListRef = useRef<HTMLDivElement>(null);
 
   // Core functions that need to be defined before their dependencies
   const scanFolder = useCallback(async (path: string) => {
@@ -165,7 +163,7 @@ function App() {
       }
     }
     setError("请拖拽一个文件夹");
-  }, [scanFolder]);
+  }, []);
 
   const selectFolder = useCallback(async () => {
     try {
@@ -334,7 +332,6 @@ function App() {
 
   // Create throttled state for progress updates (150ms throttle interval)
   const progressThrottleRef = useRef(createThrottledState<ConversionProgress | null>(null, 150));
-  const [, forceUpdate] = useState(0);
 
   useEffect(() => {
     // Load settings on mount
@@ -491,7 +488,7 @@ function App() {
           </div>
 
           <div
-            ref={virtualList.parentRef as any}
+            ref={virtualList.parentRef as RefObject<HTMLDivElement>}
             className="max-h-[150px] overflow-y-auto space-y-1"
             style={{ position: 'relative' }}
           >
@@ -513,7 +510,7 @@ function App() {
             ) : files.length > 100 ? (
               // Use virtual scrolling for large file lists (> 100 items)
               <div style={{ height: virtualList.totalSize, position: 'relative' }}>
-                {virtualList.virtualItems.map((virtualRow: { index: number; key: any; size: number; start: number }) => {
+                {virtualList.virtualItems.map((virtualRow: { index: number; key: string; size: number; start: number }) => {
                   const file = files[virtualRow.index];
                   return (
                     <div
