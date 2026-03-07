@@ -789,54 +789,72 @@ fn calculate_time_stats(
     };
 
     // Calculate overall progress percentage (0.0 to 100.0)
+    // current_index is 0-based, so we need to consider:
+    // - Files already completed: current_index
+    // - Current file progress: current_file_progress
     let overall_progress = if total_count > 0 {
         ((current_index as f64) * 100.0 + current_file_progress) / (total_count as f64)
     } else {
         0.0
     };
 
-    // Estimate remaining time with improved accuracy
-    let remaining_time = if overall_progress > 0.5 && elapsed_time > 0 {
-        // Method 1: Linear extrapolation based on progress
+    // Estimate remaining time
+    let remaining_time = if overall_progress > 0.1 && elapsed_time > 0 {
+        // Method 1: Linear extrapolation based on overall progress
         let total_estimated_linear = (elapsed_time as f64) * 100.0 / overall_progress;
         let remaining_linear = total_estimated_linear - (elapsed_time as f64);
 
-        // Method 2: Consider current file's progress for finer estimation
-        let files_remaining = total_count.saturating_sub(current_index + 1);
-        let current_file_remaining = if current_file_progress < 100.0 {
-            1.0 - (current_file_progress / 100.0)
+        // Method 2: Per-file average (more accurate for consistent file sizes)
+        // Only count fully completed files for average calculation
+        let completed_files = if current_file_progress >= 100.0 {
+            current_index + 1
+        } else if current_index > 0 {
+            current_index  // Use completed files only
+        } else {
+            0
+        };
+
+        let avg_time_per_file = if completed_files > 0 {
+            elapsed_time as f64 / completed_files as f64
         } else {
             0.0
         };
 
-        // Estimate average time per file
-        let avg_time_per_file = if current_index > 0 {
-            (elapsed_time as f64) / (current_index as f64 + current_file_progress / 100.0)
+        // Files remaining (including current file if not completed)
+        let files_remaining = total_count.saturating_sub(completed_files);
+
+        let remaining_per_file = if avg_time_per_file > 0.0 && files_remaining > 0 {
+            // Adjust for current file progress
+            let current_file_fraction = if current_file_progress < 100.0 && current_index > 0 {
+                // Current file is partially done, count remaining fraction
+                1.0 - (current_file_progress / 100.0)
+            } else if current_file_progress < 100.0 {
+                // First file is partially done, count it as full remaining
+                1.0
+            } else {
+                0.0
+            };
+            (files_remaining as f64 + current_file_fraction) * avg_time_per_file
         } else {
             0.0
         };
 
-        let remaining_per_file = if avg_time_per_file > 0.0 {
-            (files_remaining as f64 + current_file_remaining) * avg_time_per_file
+        // Use weighted average:
+        // - 70% per-file estimation (more accurate for consistent file sizes)
+        // - 30% linear estimation (good for initial estimates)
+        let remaining_weighted = if remaining_per_file > 0.0 {
+            (remaining_per_file * 0.7) + (remaining_linear * 0.3)
         } else {
             remaining_linear
         };
 
-        // Use weighted average: 60% linear, 40% per-file estimation
-        // This gives more weight to overall progress while still considering recent speeds
-        let remaining_weighted = (remaining_linear * 0.6) + (remaining_per_file * 0.4);
-
         remaining_weighted.max(0.0) as u64
+    } else if elapsed_time > 0 && current_index > 0 {
+        // Early stage: simple estimate based on first file's progress
+        // This is only used when we don't have enough data
+        0
     } else {
-        // Not enough data to estimate, return 0 or a rough estimate if we have some data
-        if elapsed_time > 0 && current_index > 0 {
-            // Rough estimate based on completed files only
-            let avg_time_per_file = elapsed_time as f64 / current_index as f64;
-            let files_remaining = total_count.saturating_sub(current_index);
-            (avg_time_per_file * files_remaining as f64).max(0.0) as u64
-        } else {
-            0
-        }
+        0
     };
 
     (elapsed_time, remaining_time)
@@ -848,36 +866,36 @@ fn calculate_time_stats(
 /// Extended: download/a/b/video.blv -> output to download/result/video.mp4 (skip both "a" and "b" if each has only one subfolder)
 /// IMPORTANT: Always preserve at least the first level (sub-top level directory)
 fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf {
-    if relative_dir.components().count() <= 1 {
+    let components: Vec<_> = relative_dir.components().collect();
+    
+    if components.is_empty() || components.len() == 1 {
         // No subdirectory or only one level, keep as is (this IS the sub-top level)
         return relative_dir.to_path_buf();
     }
 
     let base_path = Path::new(base_dir);
-    let mut result_path = relative_dir.to_path_buf();
+    let mut result_components = components.clone();
     let mut current_base = base_path.to_path_buf();
 
-    // Count the original levels to ensure we preserve at least the first one
-    let original_components: Vec<_> = relative_dir.components().collect();
-    let original_level_count = original_components.len();
+    // Track how many levels we've processed to ensure we don't skip level 0
+    let mut level_processed = 0;
 
-    // Only try to skip if we have more than 1 level (need to preserve at least level 0)
-    // We can skip levels 1, 2, etc., but never level 0
-    let max_levels_to_skip = original_level_count.saturating_sub(1).min(3);
+    // We can skip at most 3 levels, but never level 0
+    let max_levels_to_skip = components.len().saturating_sub(1).min(3);
 
-    for skip_level in 0..max_levels_to_skip {
-        // Ensure we never skip level 0 (the first directory after base_dir)
-        if skip_level >= original_level_count {
+    for _ in 0..max_levels_to_skip {
+        if result_components.is_empty() || level_processed >= result_components.len() {
             break;
         }
 
-        // Get the first component of the current result path
-        let components: Vec<_> = result_path.components().collect();
-        if components.is_empty() {
-            break;
+        // Level 0 is the sub-top level, NEVER skip it
+        if level_processed == 0 {
+            level_processed += 1;
+            continue;
         }
 
-        let first_component = &components[0];
+        // Get the first component (current level to check)
+        let first_component = &result_components[0];
         let check_path = current_base.join(first_component);
         let display_name = format!("{}", first_component.as_os_str().to_string_lossy());
 
@@ -888,13 +906,17 @@ fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf 
                 .filter(|e| e.path().is_dir())
                 .collect();
 
-            if subdirs.len() == 1 && components.len() > 1 {
-                // Skip this level and continue checking the next
-                result_path = components[1..].iter().collect();
+            // Only skip if:
+            // 1. There's exactly one subdirectory
+            // 2. We have more components after this one (to avoid empty path)
+            // 3. This is not level 0 (already checked above)
+            if subdirs.len() == 1 && result_components.len() > 1 {
+                // Skip this level: remove first component
+                result_components.remove(0);
                 current_base = check_path;
                 log::info!("Optimizing path: skipping single subfolder '{}'", display_name);
             } else {
-                // No more single subfolders to skip, or this is the last level
+                // Cannot skip this level, stop optimizing
                 break;
             }
         } else {
@@ -902,12 +924,10 @@ fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf 
             break;
         }
 
-        if result_path.as_os_str().is_empty() {
-            break;
-        }
+        level_processed += 1;
     }
 
-    result_path
+    result_components.iter().collect()
 }
 
 #[cfg(test)]
