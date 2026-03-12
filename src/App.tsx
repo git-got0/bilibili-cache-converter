@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as dialog from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -14,6 +14,50 @@ import { formatFileSize, formatTime } from "@/lib/utils";
 import { createThrottledState } from "@/hooks/useThrottle";
 import { useVirtualList } from "@/hooks/useVirtualList";
 import { toast } from "sonner";
+
+// ========== 类型定义 ==========
+
+interface DialogState {
+  showSettings: boolean;
+  showComplete: boolean;
+  showCancel: boolean;
+  showOpenFolder: boolean;
+  showIntegrity: boolean;
+}
+
+// ========== 辅助函数 ==========
+
+/**
+ * 解析对话框返回值
+ */
+function parseDialogPath(selected: string | string[] | unknown | null): string | null {
+  if (!selected) return null;
+  if (typeof selected === 'string') return selected.trim();
+  if (Array.isArray(selected)) return selected[0]?.trim() || null;
+  if (selected && typeof selected === 'object' && 'path' in selected) {
+    return (selected as { path?: string }).path?.trim() || null;
+  }
+  return null;
+}
+
+/**
+ * 验证路径格式
+ */
+function validatePath(path: string): { valid: boolean; error?: string } {
+  const trimmed = path.trim();
+  if (!trimmed) return { valid: false, error: "路径无效" };
+  if (!/^([a-zA-Z]:\\|\\\\|\/)/.test(trimmed)) {
+    return { valid: false, error: "路径格式无效" };
+  }
+  return { valid: true };
+}
+
+/**
+ * 验证并发数
+ */
+function validateConcurrency(value: number): boolean {
+  return [1, 2, 4, 8].includes(value);
+}
 
 // Memoized file item component for performance
 const FileItem = React.memo(({ file }: { file: MediaFile }) => (
@@ -89,16 +133,12 @@ function App() {
   const updateSettings = useCallback(async (newSettings: Partial<AppSettings>) => {
     try {
       // Validate concurrency value BEFORE updating state
-      if (newSettings.concurrency !== undefined) {
-        const validConcurrency = [1, 2, 4, 8];
-        if (!validConcurrency.includes(newSettings.concurrency)) {
-          console.error("Invalid concurrency value:", newSettings.concurrency);
-          return;
-        }
+      if (newSettings.concurrency !== undefined && !validateConcurrency(newSettings.concurrency)) {
+        console.error("Invalid concurrency value:", newSettings.concurrency);
+        return;
       }
 
       const updated = { ...settings, ...newSettings };
-      // Only update local state after successful backend update
       await invoke("update_settings", { newSettings: updated });
       setSettings(updated);
     } catch (err) {
@@ -178,39 +218,28 @@ function App() {
         multiple: false,
         title: "选择Bilibili缓存文件夹",
       });
-      if (selected) {
-        let path: string;
-        if (typeof selected === 'string') {
-          path = selected;
-        } else if (Array.isArray(selected)) {
-          path = selected[0];
-        } else {
-          path = (selected as { path?: string }).path || '';
-        }
 
-        // Validate path format and not empty
-        const trimmedPath = path.trim();
-        if (!trimmedPath || trimmedPath.length === 0) {
-          setError("选择的路径无效");
-          return;
-        }
-
-        // Basic path format validation
-        if (!/^([a-zA-Z]:\\|\\\\|\/)/.test(trimmedPath)) {
-          setError("路径格式无效");
-          return;
-        }
-
-        setFolderPath(trimmedPath);
-        // 获取默认输出路径
-        try {
-          const defaultPath = await invoke<string>("get_default_output_path", { folderPath: trimmedPath });
-          setDefaultOutputPath(defaultPath);
-        } catch (err) {
-          console.error("Error getting default output path:", err);
-        }
-        await scanFolder(trimmedPath);
+      const path = parseDialogPath(selected);
+      if (!path) {
+        setError("未选择文件夹");
+        return;
       }
+
+      // Validate path format
+      const validation = validatePath(path);
+      if (!validation.valid) {
+        setError(validation.error || "路径无效");
+        return;
+      }
+
+      setFolderPath(path);
+      try {
+        const defaultPath = await invoke<string>("get_default_output_path", { folderPath: path });
+        setDefaultOutputPath(defaultPath);
+      } catch (err) {
+        console.error("Error getting default output path:", err);
+      }
+      await scanFolder(path);
     } catch (err) {
       console.error("Error selecting folder:", err);
       setError("选择文件夹失败: " + String(err));
@@ -224,33 +253,23 @@ function App() {
         multiple: false,
         title: "选择输出文件夹",
       });
-      if (selected) {
-        let path: string;
-        if (typeof selected === 'string') {
-          path = selected;
-        } else if (Array.isArray(selected)) {
-          path = selected[0];
-        } else {
-          path = (selected as { path?: string }).path || '';
-        }
 
-        // Validate path format and not empty
-        const trimmedPath = path.trim();
-        if (!trimmedPath || trimmedPath.length === 0) {
-          setError("选择的路径无效");
-          return;
-        }
-
-        // Basic path format validation
-        if (!/^([a-zA-Z]:\\|\\\\|\/)/.test(trimmedPath)) {
-          setError("路径格式无效");
-          return;
-        }
-
-        await invoke("ensure_output_directory", { path: trimmedPath });
-        setOutputPath(trimmedPath);
-        await updateSettings({ output_path: trimmedPath });
+      const path = parseDialogPath(selected);
+      if (!path) {
+        setError("未选择文件夹");
+        return;
       }
+
+      // Validate path format
+      const validation = validatePath(path);
+      if (!validation.valid) {
+        setError(validation.error || "路径无效");
+        return;
+      }
+
+      await invoke("ensure_output_directory", { path });
+      setOutputPath(path);
+      await updateSettings({ output_path: path });
     } catch (err) {
       console.error("Error selecting output folder:", err);
       setError("选择输出文件夹失败: " + String(err));
@@ -354,16 +373,19 @@ function App() {
     };
     loadSettings();
 
-    // Use throttled progress updates to avoid excessive re-renders
-    const unlistenProgress = listen<ConversionProgress>("conversion-progress", (event) => {
+    // Register all event listeners
+    const unlisteners: UnlistenFn[] = [];
+
+    // Progress listener with throttling
+    listen<ConversionProgress>("conversion-progress", (event) => {
       const throttled = progressThrottleRef.current;
       const applied = throttled.setValue(event.payload);
       if (applied !== null) {
         setProgress(applied);
       }
-    });
+    }).then(fn => unlisteners.push(fn));
 
-    // Force periodic flush of throttled state (every 200ms to ensure updates during slow periods)
+    // Periodic flush for throttled state
     const flushInterval = setInterval(() => {
       const throttled = progressThrottleRef.current;
       const value = throttled.forceFlush();
@@ -372,11 +394,13 @@ function App() {
       }
     }, 200);
 
-    const unlistenScanProgress = listen<ScanProgress>("scan-progress", (event) => {
+    // Scan progress listener
+    listen<ScanProgress>("scan-progress", (event) => {
       setScanProgress(event.payload);
-    });
+    }).then(fn => unlisteners.push(fn));
 
-    const unlistenComplete = listen<ConversionCompleteEvent>("conversion-complete", (event) => {
+    // Conversion complete listener
+    listen<ConversionCompleteEvent>("conversion-complete", (event) => {
       const { success_count, total_count } = event.payload;
       toast.success(`转换完成`, {
         description: `成功转换 ${success_count} / ${total_count} 个文件`,
@@ -386,22 +410,16 @@ function App() {
       setIsConverting(false);
       setIsPaused(false);
       setProgress(null);
-    });
+    }).then(fn => unlisteners.push(fn));
 
-    // Listen for pause/resume events
-    const unlistenPaused = listen("conversion-paused", () => {
-      setIsPaused(true);
-    });
+    // Pause/Resume listeners
+    listen("conversion-paused", () => setIsPaused(true)).then(fn => unlisteners.push(fn));
+    listen("conversion-resumed", () => setIsPaused(false)).then(fn => unlisteners.push(fn));
 
-    const unlistenResumed = listen("conversion-resumed", () => {
-      setIsPaused(false);
-    });
-
-    // Listen for integrity validation events
-    const unlistenIntegrity = listen<IntegrityValidation>("conversion-integrity", (event) => {
+    // Integrity validation listener
+    listen<IntegrityValidation>("conversion-integrity", (event) => {
       const validation = event.payload;
       setIntegrityValidations(prev => [...prev, validation]);
-      
       if (!validation.is_valid) {
         toast.error(`文件完整性校验失败: ${validation.file_id}`, {
           description: validation.validation_details.join(", "),
@@ -409,23 +427,12 @@ function App() {
       } else {
         toast.success(`文件完整性校验通过: ${validation.file_id}`);
       }
-    });
+    }).then(fn => unlisteners.push(fn));
 
-    // Properly cleanup event listeners and intervals
+    // Cleanup: clear interval and all listeners
     return () => {
       clearInterval(flushInterval);
-      Promise.all([unlistenProgress, unlistenScanProgress, unlistenComplete, unlistenPaused, unlistenResumed, unlistenIntegrity])
-        .then(([fn1, fn2, fn3, fn4, fn5, fn6]) => {
-          fn1?.();
-          fn2?.();
-          fn3?.();
-          fn4?.();
-          fn5?.();
-          fn6?.();
-        })
-        .catch((err) => {
-          console.error("Error cleaning up listeners:", err);
-        });
+      unlisteners.forEach(fn => fn());
     };
   }, []);
 
@@ -531,7 +538,7 @@ function App() {
             ) : files.length > 100 ? (
               // Use virtual scrolling for large file lists (> 100 items)
               <div style={{ height: virtualList.totalSize, position: 'relative' }}>
-                {virtualList.virtualItems.map((virtualRow: { index: number; key: string; size: number; start: number }) => {
+                {virtualList.virtualItems.map((virtualRow) => {
                   const file = files[virtualRow.index];
                   return (
                     <div
@@ -601,25 +608,16 @@ function App() {
         {isConverting && progress && (
           <div className="bg-[#21262D]/80 backdrop-blur-sm rounded-lg p-2 border border-[#30363D]/50 flex-shrink-0">
             <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs truncate flex-1 mr-2" title={progress.file_name}>
-                {progress.file_name.length > 50 ?
-                  progress.file_name.substring(0, 50) + '...' :
-                  progress.file_name}
+              <span className="text-xs text-[#00D9FF] whitespace-nowrap">
+                进度: {Math.round(progress.progress)}%
               </span>
               <span className="text-xs text-[#8B949E] whitespace-nowrap">
-                {progress.current_index + 1} / {progress.total_count}
-              </span>
-              <span className="text-xs text-[#00D9FF] whitespace-nowrap">
-                {Math.round(progress.progress)}%
+                {progress.current_index} / {progress.total_count} 已完成
               </span>
             </div>
             <Progress value={((progress.current_index * 100 + progress.progress) / progress.total_count)} />
             {/* Detailed progress info */}
-            <div className="flex items-center justify-between mt-1.5 text-[10px] text-[#8B949E]">
-              <div className="flex items-center gap-1">
-                <span>当前文件:</span>
-                <span className="text-[#00D9FF]">{Math.round(progress.progress)}%</span>
-              </div>
+            <div className="flex items-center justify-end mt-1.5 text-[10px] text-[#8B949E]">
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-1">
                   <span>已用时:</span>

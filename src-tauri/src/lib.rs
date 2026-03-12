@@ -9,9 +9,10 @@ use tauri::{
 use tokio::sync::Mutex;
 
 mod converter;
+mod logger;
 mod scanner;
 
-pub use converter::IntegrityValidation;
+// IntegrityValidation is defined in this file (line ~18), not in converter module
 
 /// Integrity validation result for converted files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,39 @@ pub struct IntegrityValidation {
     pub validation_details: Vec<String>,
     pub file_size: u64,
     pub expected_size: Option<u64>,
+}
+
+/// Determine the best log directory:
+/// 1. Try program installation directory (resource_dir/logs)
+/// 2. Fall back to AppData if not writable
+fn determine_log_directory(app: &tauri::App) -> std::path::PathBuf {
+    use std::fs;
+    
+    // Try resource directory (installation directory) first
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let log_dir = resource_dir.join("logs");
+        
+        // Try to create the directory
+        if fs::create_dir_all(&log_dir).is_ok() {
+            // Try to write a test file to verify permissions
+            let test_file = log_dir.join(".write_test");
+            if fs::write(&test_file, "test").is_ok() {
+                let _ = fs::remove_file(test_file);
+                return log_dir;
+            }
+        }
+    }
+    
+    // Fallback: use AppData directory
+    if let Ok(app_data_dir) = app.path().app_data_dir() {
+        let log_dir = app_data_dir.join("logs");
+        if fs::create_dir_all(&log_dir).is_ok() {
+            return log_dir;
+        }
+    }
+    
+    // Last resort: use current directory
+    std::path::PathBuf::from("logs")
 }
 
 /// Generate a simple timestamp in format: YYYY-MM-DD HH:MM:SS
@@ -275,6 +309,20 @@ async fn cancel_conversion(app: AppHandle, state: State<'_, Arc<AppState>>) -> R
     let mut is_converting = state.is_converting.lock().await;
     *is_converting = false;
 
+    // Kill all running FFmpeg processes
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        // Kill all ffmpeg.exe and ffprobe.exe processes
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "ffmpeg.exe"])
+            .spawn();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "ffprobe.exe"])
+            .spawn();
+        log::info!("Killed all FFmpeg processes");
+    }
+
     let mut tasks = state.conversion_tasks.lock().await;
     tasks.clear();
 
@@ -474,13 +522,61 @@ async fn get_default_output_path(folder_path: String) -> Result<String, String> 
     if !path.is_absolute() {
         return Err("Invalid path: must be absolute path".to_string());
     }
+
+    // Get parent directory and apply simplification rules
+    let parent = path.parent().unwrap_or(path);
+    let simplified = simplify_output_path(parent);
     
-    let base_dir = path.to_string_lossy().to_string();
-    let output_path = Path::new(&base_dir)
+    let output_path = simplified
         .join("result")
         .to_string_lossy()
         .to_string();
     Ok(output_path)
+}
+
+/// Simplify output path by removing unnecessary directory layers
+/// 
+/// Rules:
+/// 1. Remove all directories starting with "c_"
+/// 2. Remove directories with names that are 3 or fewer digits only
+/// 3. Keep directories with names that are 5 or more digits only
+/// 4. Keep all other directories
+fn simplify_output_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut result = std::path::PathBuf::new();
+    
+    // Get all components of the path
+    let components: Vec<_> = path.components()
+        .filter_map(|c| {
+            match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().to_string()),
+                _ => None,
+            }
+        })
+        .collect();
+    
+    for name in components {
+        // Rule 1: Remove directories starting with "c_"
+        if name.starts_with("c_") {
+            continue;
+        }
+        
+        // Rule 2: Remove directories with names that are 3 or fewer digits only
+        let is_short_numeric = name.chars().all(|c| c.is_ascii_digit()) && name.len() <= 3;
+        if is_short_numeric {
+            continue;
+        }
+        
+        // Rule 3: Keep directories with names that are 5 or more digits only (keep as-is)
+        // Rule 4: Keep all other directories
+        result.push(&name);
+    }
+    
+    // If result is empty, use the original path
+    if result.components().count() <= 1 {
+        return path.to_path_buf();
+    }
+    
+    result
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -515,6 +611,31 @@ pub fn run() {
         )
         .manage(app_state)
         .setup(|app| {
+            // ========== 第一部分：初始化日志系统 ==========
+            // 优先使用程序安装目录（resource_dir），如果不可写则回退到 AppData
+            let log_dir = determine_log_directory(app);
+            
+            // 初始化高级日志系统
+            let logger_config = logger::LoggerConfig {
+                log_dir: log_dir.clone(),
+                min_level: logger::LogLevel::Info,
+                max_file_size: 10 * 1024 * 1024, // 10MB
+                max_files: 30,
+                include_thread_id: true,
+                include_location: true,
+            };
+            
+            // 初始化日志系统
+            if let Err(e) = logger::init_logger(logger_config) {
+                eprintln!("Failed to initialize logger: {}", e);
+            } else {
+                logger::log(logger::LogLevel::Info, "startup", "========================================", None);
+                logger::log(logger::LogLevel::Info, "startup", "应用启动 - 日志系统初始化成功", None);
+                logger::log(logger::LogLevel::Info, "startup", &format!("日志目录: {}", log_dir.display()), None);
+                logger::log(logger::LogLevel::Info, "startup", "========================================", None);
+            }
+            
+            // ========== 第二部分：创建系统托盘图标 ==========
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;

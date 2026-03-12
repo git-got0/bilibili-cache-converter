@@ -77,6 +77,7 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
     let mut files: Vec<MediaFile> = Vec::new();
     let mut total_size: u64 = 0;
     let mut id_counter: u32 = 0;
+    let mut used_output_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     // Limit max depth to prevent deep recursion attacks
     const MAX_DEPTH: usize = 7;
@@ -137,7 +138,59 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
         };
 
         // Generate output name with part
-        let output_name = generate_output_name_with_part(&title, file_type, parent);
+        let mut output_name = generate_output_name_with_part(&title, file_type, parent);
+
+        // Handle duplicate output names
+        if let Some(existing_path) = used_output_names.get(&output_name) {
+            // Check if it's the same source file
+            if existing_path == &file_path.to_string_lossy().to_string() {
+                // Same file, skip
+                log::debug!("[Scanner] Skipping duplicate file: {}", file_name);
+                continue;
+            }
+            // Different file with same output name - try to shorten and add suffix
+            log::info!("[Scanner] Duplicate output name detected: {}, shortening...", output_name);
+            
+            // Get file extension
+            let (base_name, ext) = if let Some(dot_pos) = output_name.rfind('.') {
+                (&output_name[..dot_pos], &output_name[dot_pos..])
+            } else {
+                (output_name.as_str(), "")
+            };
+            
+            // Try shortening middle to "..."
+            let shortened = if base_name.len() > 20 {
+                let mid = base_name.len() / 2;
+                let new_base = format!("{}...{}", &base_name[..10], &base_name[mid..]);
+                format!("{}{}", new_base, ext)
+            } else {
+                output_name.clone()
+            };
+            
+            // Check if shortened name is available
+            if !used_output_names.contains_key(&shortened) {
+                output_name = shortened;
+            } else {
+                // Still duplicate, add suffix
+                let mut counter = 2;
+                loop {
+                    let new_name = format!("{}_{}{}", base_name, counter, ext);
+                    if !used_output_names.contains_key(&new_name) {
+                        output_name = new_name;
+                        break;
+                    }
+                    counter += 1;
+                    if counter > 100 {
+                        // Fallback to original with counter
+                        output_name = format!("{}_{}{}", base_name, counter, ext);
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Record this output name with its source path
+        used_output_names.insert(output_name.clone(), file_path.to_string_lossy().to_string());
 
         let media_file = MediaFile {
             id,
@@ -274,7 +327,7 @@ fn extract_title_from_json(content: &str) -> Option<String> {
             if let Some(title) = value.and_then(|v| v.as_str()) {
                 if !title.is_empty() {
                     log::debug!("Found title at path {}: {}", path, title);
-                    return Some(truncate_chinese(title, 50));
+                    return Some(truncate_chinese(title, 80));
                 }
             }
         }
@@ -317,7 +370,7 @@ fn generate_output_name_with_part(title: &str, file_type: &str, parent_dir: &Pat
             if let Some(json_title) = extract_title_from_json(&content) {
                 log::info!("Using title from entry.json: {}", json_title);
                 let safe_json_title = sanitize_filename(&json_title);
-                let truncated_title = truncate_chinese(&safe_json_title, 50);
+                let truncated_title = truncate_chinese(&safe_json_title, 80);
                 return format!("{}.{}", truncated_title, ext);
             }
             log::warn!("Neither part nor title found in entry.json");
@@ -327,7 +380,7 @@ fn generate_output_name_with_part(title: &str, file_type: &str, parent_dir: &Pat
     }
     // Fallback to original title naming
     log::info!("Using fallback title: {}", title);
-    let truncated_title = truncate_chinese(&safe_title, 50);
+    let truncated_title = truncate_chinese(&safe_title, 80);
     format!("{}.{}", truncated_title, ext)
 }
 

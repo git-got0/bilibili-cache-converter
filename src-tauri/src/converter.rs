@@ -49,6 +49,16 @@ pub enum ConverterError {
 
 pub struct ConversionTask {
     pub cancelled: bool,
+    pub child_pid: Option<u32>,  // FFmpeg process PID
+}
+
+impl ConversionTask {
+    pub fn new() -> Self {
+        Self {
+            cancelled: false,
+            child_pid: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1015,8 +1025,7 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
     let path_obj = Path::new(output_path);
     if !path_obj.exists() {
         validation_details.push("文件不存在".to_string());
-        is_valid = false;
-        
+
         return crate::IntegrityValidation {
             file_id: original_file.id.clone(),
             is_valid: false,
@@ -1031,8 +1040,7 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
         Ok(meta) => meta,
         Err(e) => {
             validation_details.push(format!("无法读取文件元数据: {}", e));
-            is_valid = false;
-            
+
             return crate::IntegrityValidation {
                 file_id: original_file.id.clone(),
                 is_valid: false,
@@ -1097,7 +1105,7 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
     if original_file.file_type == "audio" {
         let size_diff = (output_size as i64 - original_file.size as i64).abs();
         let size_ratio = if original_file.size > 0 {
-            (size_diff as f64 / original_file.size as f64 * 100.0)
+            size_diff as f64 / original_file.size as f64 * 100.0
         } else {
             0.0
         };

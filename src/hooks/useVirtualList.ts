@@ -20,13 +20,23 @@ export interface VirtualListOptions<T> {
 }
 
 /**
+ * 虚拟项类型
+ */
+export interface VirtualItem {
+  index: number;
+  key: string | number;
+  size: number;
+  start: number;
+}
+
+/**
  * 虚拟列表返回值
  */
 export interface VirtualListResult<T> {
   /** 虚拟列表容器 ref */
   virtualizer: ReturnType<typeof useVirtualizer>;
   /** 虚拟项列表（用于渲染） */
-  virtualItems: Array<{ index: number; key: any; size: number; start: number }>;
+  virtualItems: VirtualItem[];
   /** 总尺寸 */
   totalSize: number;
   /** 滚动到指定索引 */
@@ -36,7 +46,7 @@ export interface VirtualListResult<T> {
   /** 滚动到底部 */
   scrollToBottom: () => void;
   /** 容器 ref */
-  parentRef: React.RefObject<HTMLDivElement | null>;
+  parentRef: React.RefObject<HTMLDivElement>;
 }
 
 /**
@@ -99,12 +109,12 @@ export function useVirtualList<T>({
 
   return {
     virtualizer,
-    virtualItems: virtualizer.getVirtualItems(),
+    virtualItems: virtualizer.getVirtualItems() as VirtualItem[],
     totalSize: virtualizer.getTotalSize(),
     scrollToIndex,
     scrollToTop,
     scrollToBottom,
-    parentRef: parentRef as any,
+    parentRef: parentRef as React.RefObject<HTMLDivElement>,
   };
 }
 

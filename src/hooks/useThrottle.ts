@@ -105,13 +105,7 @@ export function createThrottledState<T>(initialValue: T, throttleInterval: numbe
   let pendingValue: T | null = null;
   let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  const shouldFlush = () => {
-    const now = Date.now();
-    if (now >= lastUpdateTime + throttleInterval) {
-      return true;
-    }
-    return false;
-  };
+  const shouldFlush = () => Date.now() >= lastUpdateTime + throttleInterval;
 
   const flush = () => {
     if (pendingValue !== null && shouldFlush()) {
