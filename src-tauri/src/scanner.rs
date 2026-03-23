@@ -187,52 +187,74 @@ pub async fn scan_bilibili_files(
                 eprintln!("[scanner] 跳过重复文件：{}", file_name);
                 continue;
             }
-            // Different file with same output name - try to shorten and add suffix
-            eprintln!("[scanner] 检测到重复输出名：{}, 正在缩短...", output_name);
+            // Different file with same output name - use smarter naming strategy
+            eprintln!(
+                "[scanner] 检测到重复输出名：{}, 使用智能重命名...",
+                output_name
+            );
 
             // Get file extension
-            let (base_name, ext) = if let Some(dot_pos) = output_name.rfind('.') {
+            let (base_name, ext_str) = if let Some(dot_pos) = output_name.rfind('.') {
                 (&output_name[..dot_pos], &output_name[dot_pos..])
             } else {
                 (output_name.as_str(), "")
             };
 
-            // Try shortening middle to "..."
-            let shortened = if base_name.len() > 30 {
-                // 使用 chars() 而不是字节索引，避免切分 UTF-8 字符
-                let chars: Vec<char> = base_name.chars().collect();
-                if chars.len() > 30 {
-                    let start_len = 15.min(chars.len());
-                    let end_start = (chars.len() - 15).max(start_len);
-                    let new_base: String = chars[..start_len]
-                        .iter()
-                        .chain(['.', '.', '.'].iter())
-                        .chain(chars[end_start..].iter())
-                        .collect();
-                    format!("{}{}", new_base, ext)
+            // Strategy 1: Try to get part string from entry.json for unique naming
+            let shortened = if let Some(entry_json_path) = find_entry_json(parent) {
+                if let Ok(content) = std::fs::read_to_string(&entry_json_path) {
+                    // Try to extract both title and part for better naming
+                    let json_title_opt = extract_title_from_json(&content);
+                    let part_opt = extract_part_from_json(&content);
+
+                    match (json_title_opt, part_opt) {
+                        (Some(t), Some(p)) => {
+                            // Have both title and part: create unique name with title_P{part} format
+                            let safe_title = sanitize_filename(&t);
+                            format!(
+                                "{}.{}",
+                                truncate_title_with_part(&safe_title, &p.to_string(), ext_str),
+                                ext_str
+                            )
+                        }
+                        (Some(t), None) => {
+                            // Only have title: use smart truncation
+                            let safe_title = sanitize_filename(&t);
+                            smart_truncate_middle(&safe_title, 60).to_string() + ext_str
+                        }
+                        (None, Some(p)) => {
+                            // Only have part: add to base name
+                            format!("{}_P{}{}", base_name, p, ext_str)
+                        }
+                        (None, None) => {
+                            // No metadata available: use smart truncation with smaller limit
+                            smart_truncate_middle(base_name, 50).to_string() + ext_str
+                        }
+                    }
                 } else {
-                    output_name.clone()
+                    // Can't read entry.json: use smart truncation
+                    smart_truncate_middle(base_name, 50).to_string() + ext_str
                 }
             } else {
-                output_name.clone()
+                // No entry.json found: use smart truncation
+                smart_truncate_middle(base_name, 50).to_string() + ext_str
             };
 
             // Check if shortened name is available
             if !used_output_names.contains_key(&shortened) {
                 output_name = shortened;
             } else {
-                // Still duplicate, add suffix
+                // Still duplicate, add counter suffix as last resort
                 let mut counter = 2;
                 loop {
-                    let new_name = format!("{}_{}{}", base_name, counter, ext);
+                    let new_name = format!("{}_{}{}", base_name, counter, ext_str);
                     if !used_output_names.contains_key(&new_name) {
                         output_name = new_name;
                         break;
                     }
                     counter += 1;
                     if counter > 100 {
-                        // Fallback to original with counter
-                        output_name = format!("{}_{}{}", base_name, counter, ext);
+                        output_name = format!("{}_{}{}", base_name, counter, ext_str);
                         break;
                     }
                 }
@@ -403,14 +425,66 @@ fn extract_title_from_json(content: &str) -> Option<String> {
 
 fn extract_part_from_json(content: &str) -> Option<i32> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
-        // Try to extract part field (video part number)
-        if let Some(part) = json.get("part").and_then(|v| v.as_i64()) {
-            return Some(part as i32);
+        // Try to extract part field - support both number and string types
+        if let Some(part_value) = json.get("part") {
+            // Try as number first (i64)
+            if let Some(part_num) = part_value.as_i64() {
+                return Some(part_num as i32);
+            }
+            // Try as string (parse to i32)
+            if let Some(part_str) = part_value.as_str() {
+                if let Ok(part_num) = part_str.parse::<i32>() {
+                    return Some(part_num);
+                }
+            }
         }
-        // Try nested paths
-        for path in ["page_data.part", "video_info.part", "data.part"] {
-            if let Some(part) = json.pointer(path).and_then(|v| v.as_i64()) {
-                return Some(part as i32);
+
+        // Try nested paths (JSON pointer format: must start with /)
+        for path in [
+            "/entry/page_data/part",
+            "/page_data/part",
+            "/video_info/part",
+            "/data/part",
+            "/part",
+        ] {
+            if let Some(part_value) = json.pointer(path) {
+                // Try as number first
+                if let Some(part_num) = part_value.as_i64() {
+                    return Some(part_num as i32);
+                }
+                // Try as string (parse to i32)
+                if let Some(part_str) = part_value.as_str() {
+                    if let Ok(part_num) = part_str.parse::<i32>() {
+                        return Some(part_num);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract part field as string (for better duplicate naming)
+fn extract_part_string_from_json(content: &str) -> Option<String> {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+        // Try to extract part field as string
+        if let Some(part) = json.get("part").and_then(|v| v.as_str()) {
+            if !part.is_empty() {
+                return Some(part.to_string());
+            }
+        }
+        // Try nested paths (JSON pointer format: must start with /)
+        for path in [
+            "/entry/page_data/part",
+            "/page_data/part",
+            "/video_info/part",
+            "/data/part",
+            "/part",
+        ] {
+            if let Some(part) = json.pointer(path).and_then(|v| v.as_str()) {
+                if !part.is_empty() {
+                    return Some(part.to_string());
+                }
             }
         }
     }
@@ -429,19 +503,54 @@ fn generate_output_name_with_part(title: &str, file_type: &str, parent_dir: &Pat
                 "[scanner] entry.json 内容：{}",
                 &content[..content.len().min(500)]
             );
-            // Try to use part first
-            if let Some(part) = extract_part_from_json(&content) {
-                eprintln!("[scanner] 使用部分：{}", part);
+
+            // Try to extract both title and part for better naming
+            let json_title_opt = extract_title_from_json(&content);
+            // Priority: string part first (e.g., "第一集"), then numeric part (e.g., 1)
+            let part_string_opt = extract_part_string_from_json(&content);
+            let part_number_opt = extract_part_from_json(&content);
+            
+            // Combine: prefer string part, fallback to numeric part
+            let part_opt = part_string_opt.or_else(|| part_number_opt.map(|n| n.to_string()));
+
+            // Priority 1: Use both title and part if available
+            if let (Some(json_title), Some(part)) = (&json_title_opt, &part_opt) {
+                eprintln!("[scanner] 使用标题 + 部分：{}_P{}", json_title, part);
+                
+                // Check if title and part are duplicates
+                if is_title_part_duplicate(json_title, part) {
+                    // Title and part are the same (after removing whitespace), use only part
+                    eprintln!("[scanner] 检测到标题与部分重复，仅使用部分：{}", part);
+                    let safe_part = sanitize_filename(part);
+                    let truncated = smart_truncate_middle(&safe_part, 80);
+                    return format!("{}.{}", truncated, ext);
+                }
+                
+                let safe_json_title = sanitize_filename(json_title);
+                return format!(
+                    "{}.{}",
+                    truncate_title_with_part(&safe_json_title, part, ext),
+                    ext
+                );
+            }
+
+            // Priority 2: Use only part if title not found
+            if let Some(part) = &part_opt {
+                eprintln!("[scanner] 仅使用部分：{}_P{}", safe_title, part);
                 return format!("{}_P{}.{}", safe_title, part, ext);
             }
-            // Fallback to title if part not found
-            if let Some(json_title) = extract_title_from_json(&content) {
+
+            // Priority 3: Use only title if part not found
+            if let Some(json_title) = &json_title_opt {
                 eprintln!("[scanner] 从 entry.json 使用标题：{}", json_title);
-                let safe_json_title = sanitize_filename(&json_title);
-                let truncated_title = truncate_chinese(&safe_json_title, 80);
-                return format!("{}.{}", truncated_title, ext);
+                let safe_json_title = sanitize_filename(json_title);
+                let truncated = smart_truncate_middle(&safe_json_title, 80);
+                return format!("{}.{}", truncated, ext);
             }
+
             eprintln!("[scanner] entry.json 中未找到部分或标题");
+        } else {
+            eprintln!("[scanner] 读取 entry.json 失败");
         }
     } else {
         eprintln!(
@@ -449,9 +558,10 @@ fn generate_output_name_with_part(title: &str, file_type: &str, parent_dir: &Pat
             parent_dir
         );
     }
-    // Fallback to original title naming
-    eprintln!("[scanner] 使用备用标题：{}", title);
-    let truncated_title = truncate_chinese(&safe_title, 80);
+
+    // Fallback: use original title with smart truncation
+    eprintln!("[scanner] 使用备用标题：{}", safe_title);
+    let truncated_title = smart_truncate_middle(&safe_title, 80);
     format!("{}.{}", truncated_title, ext)
 }
 
@@ -469,6 +579,27 @@ fn find_entry_json(parent_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Truncate filename with "..." in the middle for long names
+fn truncate_with_middle(base_name: &str, ext: &str) -> String {
+    if base_name.len() > 30 {
+        let chars: Vec<char> = base_name.chars().collect();
+        if chars.len() > 30 {
+            let start_len = 15.min(chars.len());
+            let end_start = (chars.len() - 15).max(start_len);
+            let new_base: String = chars[..start_len]
+                .iter()
+                .chain(['.', '.', '.'].iter())
+                .chain(chars[end_start..].iter())
+                .collect();
+            format!("{}{}", new_base, ext)
+        } else {
+            format!("{}{}", base_name, ext)
+        }
+    } else {
+        format!("{}{}", base_name, ext)
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -523,4 +654,157 @@ fn truncate_chinese(s: &str, max_len: usize) -> String {
     }
 
     result
+}
+
+/// Smart truncate filename with "..." in the middle
+/// Ensures that the reduced length is at least equal to the excess length
+///
+/// # Arguments
+/// * `s` - Input string to truncate
+/// * `max_len` - Maximum allowed length
+///
+/// # Returns
+/// Truncated string with ellipsis in the middle if needed
+fn smart_truncate_middle(s: &str, max_len: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let actual_len = chars.len();
+
+    // No truncation needed
+    if actual_len <= max_len {
+        return s.to_string();
+    }
+
+    // Calculate how much we need to reduce
+    let excess = actual_len - max_len;
+    let ellipsis = "...";
+    let ellipsis_len = ellipsis.chars().count();
+
+    // We need to remove at least (excess + ellipsis_len) characters
+    let min_remove = excess + ellipsis_len;
+
+    // Calculate remaining length for the result
+    let remaining_len = max_len - ellipsis_len;
+
+    // Split evenly between start and end
+    let mut start_len = remaining_len / 2;
+    let mut end_len = remaining_len - start_len;
+
+    // Adjust to ensure we're removing at least min_remove characters
+    let total_removed = actual_len - (start_len + end_len + ellipsis_len);
+    if total_removed < min_remove {
+        // Need to remove more
+        let additional_remove = min_remove - total_removed;
+        // Reduce from both ends proportionally
+        let reduce_start = additional_remove / 2;
+        let reduce_end = additional_remove - reduce_start;
+        start_len = start_len.saturating_sub(reduce_start);
+        end_len = end_len.saturating_sub(reduce_end);
+    }
+
+    // Ensure we don't go negative
+    start_len = start_len.max(0);
+    end_len = end_len.max(0);
+
+    // Build the result
+    if start_len == 0 && end_len == 0 {
+        // Edge case: string too short to keep any content
+        return ellipsis.to_string();
+    }
+
+    let mut result = String::with_capacity(start_len + ellipsis_len + end_len);
+    result.extend(chars.iter().take(start_len));
+    result.push_str(ellipsis);
+    if end_len > 0 {
+        result.extend(chars.iter().skip(chars.len() - end_len));
+    }
+
+    result
+}
+
+/// Truncate title with part suffix, ensuring total length doesn't exceed reasonable limit
+/// Format: title_P{part} or title..._P{part} if too long
+///
+/// # Arguments
+/// * `title` - The title to truncate
+/// * `part` - The part number suffix
+/// * `ext` - File extension (for reference only, not included in return)
+///
+/// # Returns
+/// Formatted string: "title_P{part}" (without extension)
+fn truncate_title_with_part(title: &str, part: &str, _ext: &str) -> String {
+    let base_max_len = 80; // Base maximum length for title
+    let part_suffix = format!("_P{}", part);
+    let full_format = format!("{}{}", title, part_suffix);
+
+    if full_format.chars().count() <= base_max_len {
+        // Doesn't exceed limit, use full format
+        full_format
+    } else {
+        // Exceeds limit, need to truncate title
+        // Priority: preserve part suffix completely, truncate title from end
+        let part_suffix_len = part_suffix.chars().count();
+        let ellipsis = "...";
+        let ellipsis_len = ellipsis.chars().count();
+        
+        // Calculate available space for title (must include ellipsis)
+        let title_available = base_max_len.saturating_sub(part_suffix_len + ellipsis_len);
+        
+        // Ensure minimum length for title (at least 10 chars to be meaningful)
+        let title_max_len = title_available.max(10);
+        
+        // Truncate title from end only (preserve beginning, add "..." at end)
+        let truncated_title = truncate_title_from_end(title, title_max_len);
+        format!("{}{}{}", truncated_title, ellipsis, part_suffix)
+    }
+}
+
+/// Truncate title from the end, preserving the beginning
+/// This is used when part suffix needs to be preserved completely
+///
+/// # Arguments
+/// * `title` - The title to truncate
+/// * `max_len` - Maximum allowed length for title (without ellipsis)
+///
+/// # Returns
+/// Truncated title (without ellipsis, caller should add it)
+fn truncate_title_from_end(title: &str, max_len: usize) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    
+    if chars.len() <= max_len {
+        return title.to_string();
+    }
+    
+    // Take only the beginning part
+    chars.iter().take(max_len).collect()
+}
+
+/// Check if title and part are duplicates (after removing whitespace)
+/// Compares the first N characters where N is min(20, min(title_len, part_len))
+///
+/// # Arguments
+/// * `title` - The title string
+/// * `part` - The part string
+///
+/// # Returns
+/// true if title and part are the same (after normalization)
+fn is_title_part_duplicate(title: &str, part: &str) -> bool {
+    // Remove all whitespace characters from both strings
+    let title_normalized: String = title.chars().filter(|c| !c.is_whitespace()).collect();
+    let part_normalized: String = part.chars().filter(|c| !c.is_whitespace()).collect();
+    
+    // If either is empty after normalization, not a duplicate
+    if title_normalized.is_empty() || part_normalized.is_empty() {
+        return false;
+    }
+    
+    // Determine comparison length: min(20, min(title_len, part_len))
+    let title_len = title_normalized.chars().count();
+    let part_len = part_normalized.chars().count();
+    let compare_len = 20.min(title_len.min(part_len));
+    
+    // Compare first N characters
+    let title_prefix: String = title_normalized.chars().take(compare_len).collect();
+    let part_prefix: String = part_normalized.chars().take(compare_len).collect();
+    
+    title_prefix == part_prefix
 }

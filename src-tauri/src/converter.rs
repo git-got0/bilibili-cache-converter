@@ -890,13 +890,13 @@ async fn convert_single_file(
 }
 
 /// Calculate elapsed and remaining time based on current progress
-/// Uses a weighted approach that considers both overall progress and recent file speeds
+/// Optimized for concurrent conversion scenarios
 fn calculate_time_stats(
     start_time: Option<std::time::Instant>,
-    current_index: usize,
+    _current_index: usize, // Unused in concurrent mode, kept for API compatibility
     total_count: usize,
     current_file_progress: f64,
-    completed_count: usize, // 添加实时完成的文件数量参数
+    completed_count: usize,
 ) -> (u64, u64) {
     let elapsed_time = if let Some(start) = start_time {
         start.elapsed().as_secs()
@@ -904,80 +904,47 @@ fn calculate_time_stats(
         0
     };
 
-    // Calculate overall progress percentage (0.0 to 100.0)
-    // Use real-time completed_count for accurate calculation in concurrent scenario
-    let overall_progress = if total_count > 0 {
-        let completed_files = completed_count;
-        // Add current file's partial progress
-        let current_progress_fraction = current_file_progress / 100.0;
-        // Avoid double counting: if file is fully completed, it should already be in completed_count
-        let progress_ratio =
-            (completed_files as f64 + current_progress_fraction) / (total_count as f64);
-        progress_ratio.min(1.0) // Cap at 100%
+    if total_count == 0 || elapsed_time == 0 {
+        return (elapsed_time, 0);
+    }
+
+    // Calculate progress ratio based on completed_count (accurate for concurrent mode)
+    let progress_ratio = (completed_count as f64 + current_file_progress / 100.0) / (total_count as f64);
+    let progress_ratio = progress_ratio.min(1.0);
+
+    // Need at least 5% progress for reliable ETA estimation
+    if progress_ratio < 0.05 {
+        return (elapsed_time, 0);
+    }
+
+    // Method 1: Linear extrapolation (good for initial estimates)
+    let total_estimated_linear = (elapsed_time as f64) / progress_ratio;
+    let remaining_linear = total_estimated_linear - (elapsed_time as f64);
+
+    // Method 2: Per-file average (accurate for consistent file sizes)
+    let remaining_per_file = if completed_count > 0 {
+        let avg_time_per_file = elapsed_time as f64 / completed_count as f64;
+        let files_remaining = total_count.saturating_sub(completed_count);
+        // Account for current file's partial progress
+        let current_file_remaining = if current_file_progress < 100.0 {
+            1.0 - current_file_progress / 100.0
+        } else {
+            0.0
+        };
+        (files_remaining as f64 + current_file_remaining) * avg_time_per_file
     } else {
         0.0
     };
 
-    // Estimate remaining time
-    let remaining_time = if overall_progress > 0.1 && elapsed_time > 0 {
-        // Method 1: Linear extrapolation based on overall progress
-        let total_estimated_linear = (elapsed_time as f64) * 100.0 / overall_progress;
-        let remaining_linear = total_estimated_linear - (elapsed_time as f64);
-
-        // Method 2: Per-file average (more accurate for consistent file sizes)
-        // Only count fully completed files for average calculation
-        let completed_files = if current_file_progress >= 100.0 {
-            current_index + 1
-        } else if current_index > 0 {
-            current_index // Use completed files only
-        } else {
-            0
-        };
-
-        let avg_time_per_file = if completed_files > 0 {
-            elapsed_time as f64 / completed_files as f64
-        } else {
-            0.0
-        };
-
-        // Files remaining (including current file if not completed)
-        let files_remaining = total_count.saturating_sub(completed_files);
-
-        let remaining_per_file = if avg_time_per_file > 0.0 && files_remaining > 0 {
-            // Adjust for current file progress
-            let current_file_fraction = if current_file_progress < 100.0 && current_index > 0 {
-                // Current file is partially done, count remaining fraction
-                1.0 - (current_file_progress / 100.0)
-            } else if current_file_progress < 100.0 {
-                // First file is partially done, count it as full remaining
-                1.0
-            } else {
-                0.0
-            };
-            (files_remaining as f64 + current_file_fraction) * avg_time_per_file
-        } else {
-            0.0
-        };
-
-        // Use weighted average:
-        // - 70% per-file estimation (more accurate for consistent file sizes)
-        // - 30% linear estimation (good for initial estimates)
-        let remaining_weighted = if remaining_per_file > 0.0 {
-            (remaining_per_file * 0.7) + (remaining_linear * 0.3)
-        } else {
-            remaining_linear
-        };
-
-        remaining_weighted.max(0.0) as u64
-    } else if elapsed_time > 0 && current_index > 0 {
-        // Early stage: simple estimate based on first file's progress
-        // This is only used when we don't have enough data
-        0
+    // Weighted average: prefer per-file for later stages, linear for early stages
+    let weight_per_file = (progress_ratio * 0.8).min(0.7); // Max 70% weight
+    let remaining_weighted = if remaining_per_file > 0.0 {
+        remaining_per_file * weight_per_file + remaining_linear * (1.0 - weight_per_file)
     } else {
-        0
+        remaining_linear
     };
 
-    (elapsed_time, remaining_time)
+    (elapsed_time, remaining_weighted.max(0.0) as u64)
 }
 
 

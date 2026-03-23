@@ -322,6 +322,23 @@ function App() {
     overscan: 5,
   });
 
+  // Auto-scroll to the top converting file (useEffect for reliability)
+  useEffect(() => {
+    if (topConvertingIndex === -1 || !isConverting) return;
+    
+    // For virtual list (large file count)
+    if (files.length > VIRTUAL_LIST_THRESHOLD && virtualList.virtualItems.length > 0) {
+      virtualList.scrollToIndex(topConvertingIndex);
+    } else {
+      // For regular list, use DOM query
+      const element = document.querySelector(`[data-file-index="${topConvertingIndex}"]`);
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topConvertingIndex, isConverting, files.length, virtualList]);
+
   // Debug: Log virtual list state
   useEffect(() => {
     if (files.length > 0 && files.length > VIRTUAL_LIST_THRESHOLD) {
@@ -690,22 +707,16 @@ function App() {
       listen('conversion-paused', () => setIsPaused(true)).then((fn) => unlisteners.push(fn));
       listen('conversion-resumed', () => setIsPaused(false)).then((fn) => unlisteners.push(fn));
 
-      // Integrity validation listener
+      // Integrity validation listener - silent update, no individual toast
       listen<IntegrityValidation>('conversion-integrity', (event) => {
         const validation = event.payload;
         setIntegrityValidations((prev) => [...prev, validation]);
-        // Update file status to validating during validation
+        // Update file status silently
         setFileStatuses((prev) => ({
           ...prev,
           [validation.file_id]: validation.is_valid ? 'completed' : 'failed',
         }));
-        if (!validation.is_valid) {
-          toast.error(`文件完整性校验失败: ${validation.file_id}`, {
-            description: validation.validation_details.join(', '),
-          });
-        } else {
-          toast.success(`文件完整性校验通过: ${validation.file_id}`);
-        }
+        // No individual toast - summary shown in completion dialog
       }).then((fn) => unlisteners.push(fn));
 
       // Conversion cancelled listener
@@ -810,7 +821,7 @@ function App() {
         </div>
 
         {/* File List */}
-        <div className="bg-[#21262D]/80 backdrop-blur-sm rounded-lg p-3 border border-[#30363D]/50 flex-shrink-0">
+        <div className="bg-[#21262D]/80 backdrop-blur-sm rounded-lg p-3 border border-[#30363D]/50 flex-1 min-h-[160px] flex flex-col">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-1.5">
               <Video className="w-3 h-3 text-[#00D9FF]" />
@@ -824,12 +835,7 @@ function App() {
 
           <div
             ref={virtualList.parentRef}
-            className="overflow-y-auto space-y-1"
-            style={{
-              position: 'relative',
-              height: '200px',
-              maxHeight: '280px',
-            }}
+            className="overflow-y-auto space-y-1 flex-1 min-h-[120px] max-h-[35vh]"
           >
             {isScanning ? (
               <div className="text-center py-6 text-[#8B949E]">
@@ -861,16 +867,6 @@ function App() {
                       <div
                         key={virtualRow.key}
                         data-file-index={virtualRow.index}
-                        ref={(el) => {
-                          // Auto-scroll to the top converting file in concurrent mode
-                          if (
-                            topConvertingIndex !== -1 &&
-                            virtualRow.index === topConvertingIndex &&
-                            el
-                          ) {
-                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                          }
-                        }}
                         style={{
                           position: 'absolute',
                           top: 0,
@@ -895,12 +891,7 @@ function App() {
               files.map((file, index) => (
                 <div
                   key={file.id}
-                  ref={(el) => {
-                    // Auto-scroll to the top converting file in concurrent mode
-                    if (topConvertingIndex !== -1 && index === topConvertingIndex && el) {
-                      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    }
-                  }}
+                  data-file-index={index}
                 >
                   <FileItem file={file} status={fileStatuses[file.id]} />
                 </div>

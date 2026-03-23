@@ -362,6 +362,35 @@ pub struct ConversionCancelledEvent {
     pub total_count: usize,
 }
 
+/// Cleanup all FFmpeg processes before exit
+/// This function should be called when:
+/// 1. User chooses to exit the program
+/// 2. Panic occurs
+/// 3. Program receives termination signal
+fn cleanup_ffmpeg_processes() {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        // Kill all ffmpeg.exe and ffprobe.exe processes
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "ffmpeg.exe"])
+            .spawn();
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "ffprobe.exe"])
+            .spawn();
+        eprintln!("[清理] 已终止所有 FFmpeg 进程");
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+        // Unix-like systems: use pkill
+        let _ = Command::new("pkill").arg("ffmpeg").spawn();
+        let _ = Command::new("pkill").arg("ffprobe").spawn();
+        eprintln!("[清理] 已终止所有 FFmpeg 进程");
+    }
+}
+
 #[tauri::command]
 async fn cancel_conversion(
     app: AppHandle,
@@ -381,18 +410,7 @@ async fn cancel_conversion(
     *is_converting = false;
 
     // Kill all running FFmpeg processes
-    #[cfg(windows)]
-    {
-        use std::process::Command;
-        // Kill all ffmpeg.exe and ffprobe.exe processes
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "ffmpeg.exe"])
-            .spawn();
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", "ffprobe.exe"])
-            .spawn();
-        eprintln!("[命令] 已终止所有 FFmpeg 进程");
-    }
+    cleanup_ffmpeg_processes();
 
     let mut tasks = state.conversion_tasks.lock().await;
     tasks.clear();
@@ -753,6 +771,9 @@ pub fn run() {
         eprintln!("堆栈跟踪:\n{}", backtrace);
         eprintln!("===========================================");
 
+        // Cleanup FFmpeg processes before crash
+        cleanup_ffmpeg_processes();
+
         // 尝试记录到日志（如果日志系统可用）- DISABLED
         let msg = format!("Panic in thread '{}': {:?}", thread_name, info);
         // log::error!("{}", msg);  // DISABLED: Logging temporarily disabled
@@ -842,7 +863,76 @@ pub fn run() {
             */
 
             eprintln!("[诊断] setup() 被调用 - 日志系统已禁用，仅使用 eprintln");
+
+            // Create system tray with menu
+            let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出程序", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let _tray = TrayIconBuilder::new()
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        eprintln!("[托盘] 用户选择退出程序");
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Prevent default close behavior
+                api.prevent_close();
+
+                let app_handle = window.app_handle().clone();
+
+                // Show dialog
+                use tauri_plugin_dialog::DialogExt;
+
+                let dialog = app_handle.dialog();
+                dialog
+                    .message("是否最小化到系统托盘？\n点击\"取消\"将退出程序")
+                    .title("关闭程序")
+                    .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancel)
+                    .show(move |answer| {
+                        if answer {
+                            // User chose "OK" - minimize to tray
+                            eprintln!("[窗口] 用户选择最小化到托盘");
+                            if let Some(win) = app_handle.get_webview_window("main") {
+                                let _ = win.hide();
+                            }
+                        } else {
+                            // User chose "Cancel" or closed dialog - exit
+                            eprintln!("[窗口] 用户选择退出程序");
+                            // Cleanup FFmpeg processes before exit
+                            cleanup_ffmpeg_processes();
+                            app_handle.exit(0);
+                        }
+                    });
+            }
         })
         .invoke_handler(tauri::generate_handler![
             scan_folder,
@@ -855,6 +945,8 @@ pub fn run() {
             get_settings,
             open_output_folder,
             update_settings,
+            pause_conversion,
+            resume_conversion,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {
