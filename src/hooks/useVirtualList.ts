@@ -1,4 +1,4 @@
-import { useRef, useMemo, useCallback } from 'react';
+import { useRef, useMemo, useCallback, useEffect } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
 /**
@@ -7,8 +7,6 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 export interface VirtualListOptions<T> {
   /** 数据列表 */
   items: T[];
-  /** 容器高度 */
-  containerHeight: number;
   /** 单项高度（固定高度模式）*/
   itemHeight?: number;
   /** 预估高度（动态高度模式） */
@@ -32,7 +30,7 @@ export interface VirtualItem {
 /**
  * 虚拟列表返回值
  */
-export interface VirtualListResult<T> {
+export interface VirtualListResult {
   /** 虚拟列表容器 ref */
   virtualizer: ReturnType<typeof useVirtualizer>;
   /** 虚拟项列表（用于渲染） */
@@ -55,12 +53,11 @@ export interface VirtualListResult<T> {
  */
 export function useVirtualList<T>({
   items,
-  containerHeight,
   itemHeight = 40,
   estimatedItemSize,
   overscan = 5,
   getKey,
-}: VirtualListOptions<T>): VirtualListResult<T> {
+}: VirtualListOptions<T>): VirtualListResult {
   const parentRef = useRef<HTMLDivElement | null>(null);
 
   const keyGetter = useCallback(
@@ -76,14 +73,58 @@ export function useVirtualList<T>({
     },
     [items, getKey]
   );
-
+  // 关键修复：添加元素尺寸观察，确保虚拟列表正确初始化
+  // @tanstack/react-v3 需要显式配置或使用 undefined 启用默认行为
   const virtualizer = useVirtualizer({
     count: items.length,
-    getScrollElement: () => parentRef.current as Element | null,
-    estimateSize: useCallback(() => estimatedItemSize || itemHeight, [estimatedItemSize, itemHeight]),
+    getScrollElement: () => {
+      if (!parentRef.current) {
+        console.warn('[useVirtualList] parentRef.current is null');
+        return null;
+      }
+      return parentRef.current as Element | null;
+    },
+    estimateSize: useCallback(() => {
+      const size = estimatedItemSize || itemHeight;
+      if (size <= 0) {
+        console.warn('[useVirtualList] estimateSize is zero or negative:', size);
+      }
+      return size;
+    }, [estimatedItemSize, itemHeight]),
     overscan,
     getItemKey: keyGetter,
+    // 关键修复：确保在 items 变化时重新测量
+    measureElement: (element: Element) => {
+      if (!(element instanceof HTMLElement)) return itemHeight;
+      return element.offsetHeight || itemHeight;
+    },
+    // 初始偏移量，帮助库在挂载前计算
+    initialRect: { width: 0, height: 200 },
   });
+
+  // Debug: Log virtualizer initialization
+  useMemo(() => {
+    if (items.length > 0) {
+      const vItems = virtualizer.getVirtualItems();
+      console.log(
+        '[useVirtualList] ✅ items:',
+        items.length,
+        '| virtualItems:',
+        vItems.length,
+        '| totalSize:',
+        virtualizer.getTotalSize()
+      );
+    }
+  }, [items.length, virtualizer]);
+
+  // 关键修复：当 items 变化时，强制重新计算虚拟列表
+  useEffect(() => {
+    if (items.length > 0 && parentRef.current) {
+      console.log('[useVirtualList] Items changed, remeasuring...');
+      // 触发重新测量
+      virtualizer.measure();
+    }
+  }, [items.length, virtualizer]);
 
   const scrollToIndex = useCallback(
     (index: number) => {
@@ -124,13 +165,11 @@ export function useVirtualList<T>({
 export function useFixedVirtualList<T>(
   items: T[],
   itemHeight: number = 40,
-  containerHeight: number = 300,
   overscan: number = 5
-): VirtualListResult<T> {
+): VirtualListResult {
   return useVirtualList<T>({
     items,
     itemHeight,
-    containerHeight,
     overscan,
   });
 }

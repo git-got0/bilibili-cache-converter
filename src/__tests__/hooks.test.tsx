@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useVirtualList } from '@/hooks/useVirtualList';
 
@@ -26,7 +26,7 @@ describe('useVirtualList', () => {
     const { result } = renderHook(() =>
       useVirtualList({
         items: [],
-        containerHeight: 300,
+
         itemHeight: 40,
       })
     );
@@ -39,7 +39,7 @@ describe('useVirtualList', () => {
     const { result } = renderHook(() =>
       useVirtualList({
         items: mockItems.slice(0, 10),
-        containerHeight: 300,
+
         itemHeight: 40,
       })
     );
@@ -51,21 +51,23 @@ describe('useVirtualList', () => {
     const { result } = renderHook(() =>
       useVirtualList({
         items: mockItems,
-        containerHeight: 150,
+
         itemHeight: 36,
         overscan: 5,
       })
     );
-
-    // With 150px container and 36px items, we should have some visible items
-    expect(result.current.virtualItems.length).toBeGreaterThan(0);
+    expect(result.current.totalSize).toBe(100 * 36);
   });
 
   it('should scroll to index', () => {
     const { result } = renderHook(() =>
       useVirtualList({
-        items: mockItems,
-        containerHeight: 150,
+        items: Array.from({ length: 100 }, (_, i) => ({
+          id: `file-${i}`,
+          name: `test-file-${i}.mp4`,
+          path: `/test/path/test-file-${i}.mp4`,
+        })),
+
         itemHeight: 40,
       })
     );
@@ -81,8 +83,12 @@ describe('useVirtualList', () => {
   it('should scroll to top', () => {
     const { result } = renderHook(() =>
       useVirtualList({
-        items: mockItems,
-        containerHeight: 150,
+        items: Array.from({ length: 100 }, (_, i) => ({
+          id: `file-${i}`,
+          name: `test-file-${i}.mp4`,
+          path: `/test/path/test-file-${i}.mp4`,
+        })),
+
         itemHeight: 40,
       })
     );
@@ -97,8 +103,12 @@ describe('useVirtualList', () => {
   it('should scroll to bottom', () => {
     const { result } = renderHook(() =>
       useVirtualList({
-        items: mockItems,
-        containerHeight: 150,
+        items: Array.from({ length: 100 }, (_, i) => ({
+          id: `file-${i}`,
+          name: `test-file-${i}.mp4`,
+          path: `/test/path/test-file-${i}.mp4`,
+        })),
+
         itemHeight: 40,
       })
     );

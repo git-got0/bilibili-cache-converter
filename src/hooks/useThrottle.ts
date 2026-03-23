@@ -36,7 +36,7 @@ export function useThrottleCallback<T extends (...args: unknown[]) => void>(
 
   useEffect(() => {
     return () => {
-      if (timeoutRef.current) {
+      if (timeoutRef.current !== null) {
         clearTimeout(timeoutRef.current);
       }
     };
@@ -49,7 +49,7 @@ export function useThrottleCallback<T extends (...args: unknown[]) => void>(
         lastRunRef.current = now;
         callback(...args);
       } else {
-        if (timeoutRef.current) {
+        if (timeoutRef.current !== null) {
           clearTimeout(timeoutRef.current);
         }
         timeoutRef.current = setTimeout(() => {
@@ -76,7 +76,7 @@ export function useDebouncedCallback<T extends (...args: unknown[]) => void>(
 
   useEffect(() => {
     return () => {
-      if (timeoutRef.current) {
+      if (timeoutRef.current !== null) {
         clearTimeout(timeoutRef.current);
       }
     };
@@ -84,7 +84,7 @@ export function useDebouncedCallback<T extends (...args: unknown[]) => void>(
 
   return useCallback(
     ((...args: unknown[]) => {
-      if (timeoutRef.current) {
+      if (timeoutRef.current !== null) {
         clearTimeout(timeoutRef.current);
       }
       timeoutRef.current = setTimeout(() => {
@@ -105,34 +105,36 @@ export function createThrottledState<T>(initialValue: T, throttleInterval: numbe
   let pendingValue: T | null = null;
   let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  const shouldFlush = () => Date.now() >= lastUpdateTime + throttleInterval;
+  // const shouldFlush = () => Date.now() >= lastUpdateTime + throttleInterval;
 
-  const flush = () => {
-    if (pendingValue !== null && shouldFlush()) {
+  let lastFlushedValue: T | null = null;
+
+  const flush = (): T | null => {
+    if (flushTimeout !== null) {
+      clearTimeout(flushTimeout);
+      flushTimeout = null;
+    }
+    if (pendingValue !== null) {
       lastValue = pendingValue;
+      lastFlushedValue = pendingValue;
       lastUpdateTime = Date.now();
       pendingValue = null;
-      if (flushTimeout) {
-        clearTimeout(flushTimeout);
-        flushTimeout = null;
-      }
-      return true;
+      return lastValue;
     }
-    return false;
+    return null;
   };
 
   const setValue = (newValue: T): T | null => {
     const now = Date.now();
 
-    // 如果距离上次更新已经超过节流间隔，立即更新
     if (now >= lastUpdateTime + throttleInterval) {
       lastValue = newValue;
       lastUpdateTime = now;
       pendingValue = null;
+      lastFlushedValue = newValue;
       return newValue;
     }
 
-    // 否则缓存新值，安排延迟更新
     pendingValue = newValue;
     if (!flushTimeout) {
       const remaining = throttleInterval - (now - lastUpdateTime);
@@ -142,20 +144,26 @@ export function createThrottledState<T>(initialValue: T, throttleInterval: numbe
       }, remaining);
     }
 
-    return null; // 返回 null 表示值被缓存，尚未应用
+    return null;
   };
 
   const getValue = (): T => lastValue;
 
   const forceFlush = (): T | null => {
-    if (flushTimeout) {
+    if (flushTimeout !== null) {
       clearTimeout(flushTimeout);
       flushTimeout = null;
     }
-    if (flush()) {
+    if (pendingValue !== null) {
+      lastValue = pendingValue;
+      lastFlushedValue = pendingValue;
+      lastUpdateTime = Date.now();
+      pendingValue = null;
       return lastValue;
     }
-    return pendingValue;
+    const result = lastFlushedValue;
+    lastFlushedValue = null;
+    return result;
   };
 
   return { setValue, getValue, forceFlush };

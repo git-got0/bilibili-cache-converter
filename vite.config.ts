@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 
 export default defineConfig({
-  base: './',  // 使用相对路径，确保 Tauri 能正确加载资源
+  base: './',
   plugins: [react()],
   resolve: {
     alias: {
@@ -20,5 +20,14 @@ export default defineConfig({
     target: process.env.TAURI_PLATFORM === 'windows' ? 'chrome105' : 'safari13',
     minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
     sourcemap: !!process.env.TAURI_DEBUG,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom'],
+          'ui-vendor': ['@radix-ui/react-dialog', '@radix-ui/react-label', '@radix-ui/react-progress'],
+          'utils-vendor': ['clsx', 'tailwind-merge'],
+        },
+      },
+    },
   },
 })

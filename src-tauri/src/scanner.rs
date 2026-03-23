@@ -20,13 +20,9 @@ pub enum ScanError {
 // - Video files: video.m4s (DASH), .blv (old format), .flv, .ts
 // - Audio files: audio.m4s (DASH), .aac
 // Note: .m4s files need to be checked by name (video.m4s vs audio.m4s) since both use .m4s extension
-static VIDEO_EXTENSIONS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\.(blv|flv|ts)$").unwrap()
-});
+static VIDEO_EXTENSIONS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.(blv|flv|ts)$").unwrap());
 
-static AUDIO_EXTENSIONS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\.aac$").unwrap()
-});
+static AUDIO_EXTENSIONS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\.aac$").unwrap());
 
 /// Determine the type of a Bilibili cache file
 fn determine_file_type(_file_path: &Path, file_name: &str) -> Option<&'static str> {
@@ -53,77 +49,120 @@ fn determine_file_type(_file_path: &Path, file_name: &str) -> Option<&'static st
 }
 
 #[allow(dead_code)]
-static TITLE_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(\d+)\.blv$|video\.m4s$|audio\.m4s$").unwrap()
-});
+static TITLE_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\d+)\.blv$|video\.m4s$|audio\.m4s$").unwrap());
 
-pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle>) -> Result<ScanResult, ScanError> {
+pub async fn scan_bilibili_files(
+    folder_path: &str,
+    app: Option<tauri::AppHandle>,
+) -> Result<ScanResult, ScanError> {
     let path = Path::new(folder_path);
 
-    log::info!("[Scanner] Starting scan of: {}", folder_path);
+    // log::info!("开始扫描：{}", folder_path);  // DISABLED: Logging temporarily disabled
 
     // Validate path
     if !path.exists() {
-        log::error!("[Scanner] Path does not exist: {}", folder_path);
+        // log::error!("路径不存在：{}", folder_path);  // DISABLED
         return Err(ScanError::InvalidPath);
     }
 
     // Validate that path is a directory
     if !path.is_dir() {
-        log::error!("[Scanner] Path is not a directory: {}", folder_path);
+        // log::error!("路径不是目录：{}", folder_path);  // DISABLED
         return Err(ScanError::InvalidPath);
     }
 
+    // log::info!("路径验证通过，开始遍历目录树");  // DISABLED
+
     let mut files: Vec<MediaFile> = Vec::new();
     let mut total_size: u64 = 0;
-    let mut id_counter: u32 = 0;
-    let mut used_output_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut id_counter: u64 = 0;
+    let mut used_output_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // Limit max depth to prevent deep recursion attacks
     const MAX_DEPTH: usize = 7;
 
+    // 计数器用于诊断
+    let mut entry_count: usize = 0;
+    let mut error_count: usize = 0;
+
     for entry in WalkDir::new(path)
         .max_depth(MAX_DEPTH)
-        .follow_links(false)  // Don't follow symlinks to prevent infinite loops
+        .follow_links(false) // Don't follow symlinks to prevent infinite loops
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e.ok() {
+            Some(entry) => {
+                entry_count += 1;
+                Some(entry)
+            }
+            None => {
+                error_count += 1;
+                None
+            }
+        })
     {
         let file_path = entry.path();
         if !file_path.is_file() {
             continue;
         }
 
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        // 安全获取文件名
+        let file_name = match file_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => {
+                eprintln!("[scanner] 警告：无法获取文件名，跳过：{:?}", file_path);
+                continue;
+            }
+        };
 
-        // Determine file type
-        let file_type = determine_file_type(file_path, file_name);
+        eprintln!(
+            "[scanner] 找到媒体文件：{} (类型：{:?})",
+            file_name,
+            determine_file_type(file_path, file_name)
+        );
 
-        // Skip non-media files
-        if file_type.is_none() {
-            continue;
-        }
-
-        log::debug!("[Scanner] Found media file: {} (type: {:?})", file_name, file_type);
-
-        // Get parent directory info
-        let parent = file_path.parent().unwrap_or(file_path);
+        // Get parent directory info (安全版本)
+        let parent = match file_path.parent() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "[scanner] 警告：无法获取父目录，使用文件路径本身：{:?}",
+                    file_path
+                );
+                file_path
+            }
+        };
 
         // Try to extract title from directory structure
         let title = extract_title(parent, file_name);
 
-        let metadata = entry.metadata()?;
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[scanner] 警告：无法获取文件 {:?} 的元数据：{}. 跳过此文件。",
+                    file_path, e
+                );
+                continue;
+            }
+        };
         let file_size = metadata.len();
         total_size += file_size;
 
-        let file_type = determine_file_type(file_path, file_name).unwrap();
+        // safe unwrap: file_type was checked for None above, but add defensive check
+        let file_type = match determine_file_type(file_path, file_name) {
+            Some(t) => t,
+            None => {
+                eprintln!("[scanner] 错误：检查后仍然无法确定文件类型：{}", file_name);
+                continue;
+            }
+        };
 
         // Skip audio files that are part of video (they will be combined)
         // Only skip if this is audio.m4s and video.m4s exists in same directory
         if file_type == "audio" && parent.join("video.m4s").exists() {
-            log::debug!("[Scanner] Skipping audio file (has video): {}", file_name);
+            eprintln!("[scanner] 跳过音频文件（有视频）：{}", file_name);
             continue;
         }
 
@@ -145,28 +184,39 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
             // Check if it's the same source file
             if existing_path == &file_path.to_string_lossy().to_string() {
                 // Same file, skip
-                log::debug!("[Scanner] Skipping duplicate file: {}", file_name);
+                eprintln!("[scanner] 跳过重复文件：{}", file_name);
                 continue;
             }
             // Different file with same output name - try to shorten and add suffix
-            log::info!("[Scanner] Duplicate output name detected: {}, shortening...", output_name);
-            
+            eprintln!("[scanner] 检测到重复输出名：{}, 正在缩短...", output_name);
+
             // Get file extension
             let (base_name, ext) = if let Some(dot_pos) = output_name.rfind('.') {
                 (&output_name[..dot_pos], &output_name[dot_pos..])
             } else {
                 (output_name.as_str(), "")
             };
-            
+
             // Try shortening middle to "..."
-            let shortened = if base_name.len() > 20 {
-                let mid = base_name.len() / 2;
-                let new_base = format!("{}...{}", &base_name[..10], &base_name[mid..]);
-                format!("{}{}", new_base, ext)
+            let shortened = if base_name.len() > 30 {
+                // 使用 chars() 而不是字节索引，避免切分 UTF-8 字符
+                let chars: Vec<char> = base_name.chars().collect();
+                if chars.len() > 30 {
+                    let start_len = 15.min(chars.len());
+                    let end_start = (chars.len() - 15).max(start_len);
+                    let new_base: String = chars[..start_len]
+                        .iter()
+                        .chain(['.', '.', '.'].iter())
+                        .chain(chars[end_start..].iter())
+                        .collect();
+                    format!("{}{}", new_base, ext)
+                } else {
+                    output_name.clone()
+                }
             } else {
                 output_name.clone()
             };
-            
+
             // Check if shortened name is available
             if !used_output_names.contains_key(&shortened) {
                 output_name = shortened;
@@ -188,7 +238,7 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
                 }
             }
         }
-        
+
         // Record this output name with its source path
         used_output_names.insert(output_name.clone(), file_path.to_string_lossy().to_string());
 
@@ -205,10 +255,14 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
 
         // Emit scan progress event for real-time update
         if let Some(ref app_handle) = app {
-            let _ = app_handle.emit("scan-progress", ScanProgress {
-                found_files: files.len() as u32,
-                current_path: file_path.to_string_lossy().to_string(),
-            });
+            let _ = app_handle.emit(
+                "scan-progress",
+                ScanProgress {
+                    processed: files.len() as u64,
+                    total: 0, // Unknown total
+                    message: format!("已找到 {} 个文件...", files.len()),
+                },
+            );
         }
 
         files.push(media_file);
@@ -220,37 +274,48 @@ pub async fn scan_bilibili_files(folder_path: &str, app: Option<tauri::AppHandle
     let mut unique_files: Vec<MediaFile> = Vec::new();
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    log::info!("[Scanner] Processing {} raw files before deduplication", files.len());
+    eprintln!("[scanner] 处理 {} 个原始文件（去重前）", files.len());
 
     for file in files {
         if file.file_type == "video" {
             // Keep video files (skip if already seen)
             if !seen_paths.contains(&file.path) {
                 seen_paths.insert(file.path.clone());
-                log::debug!("[Scanner] Added video file: {}", file.name);
+                eprintln!("[scanner] 添加视频文件：{}", file.name);
                 unique_files.push(file);
             }
         } else if file.file_type == "audio" {
             // Keep standalone audio files (not part of a video)
             // These are audio files without a corresponding video.m4s
-            let parent = Path::new(&file.path).parent().unwrap_or(Path::new(&file.path));
+            let parent = Path::new(&file.path)
+                .parent()
+                .unwrap_or(Path::new(&file.path));
             let has_video = parent.join("video.m4s").exists();
 
             if !has_video && !seen_paths.contains(&file.path) {
                 seen_paths.insert(file.path.clone());
-                log::debug!("[Scanner] Added standalone audio file: {}", file.name);
+                eprintln!("[scanner] 添加独立音频文件：{}", file.name);
                 unique_files.push(file);
             } else if has_video {
-                log::debug!("[Scanner] Skipped audio file (has video): {}", file.name);
+                eprintln!("[scanner] 跳过音频文件（有视频）：{}", file.name);
             }
         }
     }
 
-    log::info!("[Scanner] Final result: {} unique files (total size: {:.2} MB)",
-        unique_files.len(), total_size as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "[scanner] 最终结果：{} 个唯一文件 (总大小：{:.2} MB)",
+        unique_files.len(),
+        total_size as f64 / (1024.0 * 1024.0)
+    );
 
     for (idx, file) in unique_files.iter().enumerate() {
-        log::debug!("[Scanner] File {}: {} ({}) - {}", idx + 1, file.name, file.file_type, file.title);
+        eprintln!(
+            "[scanner] 文件 {}: {} ({}) - {}",
+            idx + 1,
+            file.name,
+            file.file_type,
+            file.title
+        );
     }
 
     Ok(ScanResult {
@@ -326,13 +391,13 @@ fn extract_title_from_json(content: &str) -> Option<String> {
 
             if let Some(title) = value.and_then(|v| v.as_str()) {
                 if !title.is_empty() {
-                    log::debug!("Found title at path {}: {}", path, title);
+                    eprintln!("[scanner] 在路径 {} 找到标题：{}", path, title);
                     return Some(truncate_chinese(title, 80));
                 }
             }
         }
     }
-    log::debug!("No title found in JSON");
+    eprintln!("[scanner] JSON 中未找到标题");
     None
 }
 
@@ -358,28 +423,34 @@ fn generate_output_name_with_part(title: &str, file_type: &str, parent_dir: &Pat
 
     // Try to find entry.json in parent directory (one level up from media files)
     if let Some(entry_json_path) = find_entry_json(parent_dir) {
-        log::info!("Found entry.json at: {:?}", entry_json_path);
+        eprintln!("[scanner] 在 {:?} 找到 entry.json", entry_json_path);
         if let Ok(content) = std::fs::read_to_string(&entry_json_path) {
-            log::debug!("Entry.json content: {}", &content[..content.len().min(500)]);
+            eprintln!(
+                "[scanner] entry.json 内容：{}",
+                &content[..content.len().min(500)]
+            );
             // Try to use part first
             if let Some(part) = extract_part_from_json(&content) {
-                log::info!("Using part: {}", part);
+                eprintln!("[scanner] 使用部分：{}", part);
                 return format!("{}_P{}.{}", safe_title, part, ext);
             }
             // Fallback to title if part not found
             if let Some(json_title) = extract_title_from_json(&content) {
-                log::info!("Using title from entry.json: {}", json_title);
+                eprintln!("[scanner] 从 entry.json 使用标题：{}", json_title);
                 let safe_json_title = sanitize_filename(&json_title);
                 let truncated_title = truncate_chinese(&safe_json_title, 80);
                 return format!("{}.{}", truncated_title, ext);
             }
-            log::warn!("Neither part nor title found in entry.json");
+            eprintln!("[scanner] entry.json 中未找到部分或标题");
         }
     } else {
-        log::warn!("No entry.json found in {:?} or its parent", parent_dir);
+        eprintln!(
+            "[scanner] 在 {:?} 或其父目录中未找到 entry.json",
+            parent_dir
+        );
     }
     // Fallback to original title naming
-    log::info!("Using fallback title: {}", title);
+    eprintln!("[scanner] 使用备用标题：{}", title);
     let truncated_title = truncate_chinese(&safe_title, 80);
     format!("{}.{}", truncated_title, ext)
 }
@@ -402,7 +473,9 @@ fn find_entry_json(parent_dir: &Path) -> Option<PathBuf> {
 
 fn sanitize_filename(name: &str) -> String {
     // More comprehensive sanitization to prevent path traversal and injection
-    let invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0', '\n', '\r', '\t'];
+    let invalid_chars = [
+        '<', '>', ':', '"', '/', '\\', '|', '?', '*', '\0', '\n', '\r', '\t',
+    ];
     let mut result = String::new();
 
     for c in name.chars() {

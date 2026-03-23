@@ -3,6 +3,24 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "description": "一款高性能的桌面应用程序，用于将 Bilibili缓存的音视频文件转换为通用格式 (如 MP4、MP3 等)",
+  "author": "Developer",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/bilibili-converter.git"
+  },
+  "keywords": [
+    "bilibili",
+    "video-converter",
+    "audio-converter",
+    "ffmpeg",
+    "tauri",
+    "rust",
+    "react",
+    "desktop-app",
+    "windows"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

@@ -1,4 +1,6 @@
-use crate::{AppSettings, AppState, ConversionProgress, ConversionResult, MediaFile};
+use crate::{
+    AppSettings, AppState, ConversionProgress, ConversionResult, MediaFile,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -49,7 +51,7 @@ pub enum ConverterError {
 
 pub struct ConversionTask {
     pub cancelled: bool,
-    pub child_pid: Option<u32>,  // FFmpeg process PID
+    pub child_pid: Option<u32>, // FFmpeg process PID
 }
 
 impl ConversionTask {
@@ -64,13 +66,12 @@ impl ConversionTask {
 #[derive(Clone)]
 struct ProgressInfo {
     current_index: usize,
+    completed_count: usize,
     total_count: usize,
     start_time: Option<std::time::Instant>,
 }
 
-static PERCENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(\d+\.?\d*)%").unwrap()
-});
+static PERCENT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(\d+\.?\d*)%").unwrap());
 
 pub async fn get_ffmpeg_path(app: Option<&AppHandle>) -> Result<String, String> {
     // First, check bundled resources
@@ -80,8 +81,13 @@ pub async fn get_ffmpeg_path(app: Option<&AppHandle>) -> Result<String, String> 
             if bundled_ffmpeg.exists() {
                 let path_str = bundled_ffmpeg.to_string_lossy().to_string();
                 if test_ffmpeg_path(&path_str).await {
-                    log::info!("Using bundled FFmpeg: {}", path_str);
-                    return Ok(path_str);
+                    // Remove Windows NT path prefix (\\?\)
+                    let clean_path = path_str
+                        .strip_prefix(r"\\?\")
+                        .unwrap_or(&path_str)
+                        .to_string();
+                    eprintln!("[converter] 使用内置 FFmpeg: {}", clean_path);
+                    return Ok(clean_path);
                 }
             }
         }
@@ -125,27 +131,27 @@ pub async fn detect_gpu_type(ffmpeg_path: &str) -> GpuType {
 
             // Check for NVIDIA GPU (nvenc encoders)
             if combined.contains("h264_nvenc") || combined.contains("hevc_nvenc") {
-                log::info!("[GPU] Detected NVIDIA GPU - hardware acceleration enabled");
+                eprintln!("[converter] 检测到 NVIDIA GPU - 启用硬件加速");
                 return GpuType::Nvidia;
             }
 
             // Check for AMD GPU (amf encoders)
             if combined.contains("h264_amf") || combined.contains("hevc_amf") {
-                log::info!("[GPU] Detected AMD GPU - hardware acceleration enabled");
+                eprintln!("[converter] 检测到 AMD GPU - 启用硬件加速");
                 return GpuType::Amd;
             }
 
             // Check for Intel GPU (qsv encoders)
             if combined.contains("h264_qsv") || combined.contains("hevc_qsv") {
-                log::info!("[GPU] Detected Intel GPU - hardware acceleration enabled");
+                eprintln!("[converter] 检测到 Intel GPU - 启用硬件加速");
                 return GpuType::Intel;
             }
 
-            log::debug!("[GPU] No hardware acceleration detected - using CPU encoding");
+            eprintln!("[converter] 未检测到硬件加速 - 使用 CPU 编码");
             GpuType::None
         }
         Err(e) => {
-            log::warn!("[GPU] Failed to detect GPU: {}", e);
+            eprintln!("[converter] GPU 检测失败：{}", e);
             GpuType::None
         }
     }
@@ -240,28 +246,28 @@ pub async fn convert_files(
     // Validate output directory path
     let output_path_obj = Path::new(&output_dir);
     if !output_path_obj.is_absolute() {
-        log::error!("Invalid output path: must be absolute path");
+        eprintln!("[converter] 错误：输出路径必须是绝对路径");
         return files
             .iter()
             .map(|f| ConversionResult {
                 file_id: f.id.clone(),
                 success: false,
                 output_path: None,
-                error: Some("Invalid output path: must be absolute".to_string()),
+                error: Some("输出路径无效：必须是绝对路径".to_string()),
             })
             .collect();
     }
 
     // Ensure output directory exists
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
-        log::error!("Failed to create output directory: {}", e);
+        eprintln!("[converter] 错误：无法创建输出目录：{}", e);
         return files
             .iter()
             .map(|f| ConversionResult {
                 file_id: f.id.clone(),
                 success: false,
                 output_path: None,
-                error: Some(format!("Failed to create output directory: {}", e)),
+                error: Some(format!("无法创建输出目录：{}", e)),
             })
             .collect();
     }
@@ -270,7 +276,7 @@ pub async fn convert_files(
     let ffmpeg_path = match get_ffmpeg_path(Some(&app)).await {
         Ok(path) => path,
         Err(e) => {
-            log::error!("FFmpeg not found: {}", e);
+            eprintln!("[converter] 错误：找不到 FFmpeg: {}", e);
             return files
                 .iter()
                 .map(|f| ConversionResult {
@@ -283,16 +289,22 @@ pub async fn convert_files(
         }
     };
 
-    log::info!("Using FFmpeg at: {}", ffmpeg_path);
+    eprintln!("[converter] 使用 FFmpeg: {}", ffmpeg_path);
 
     // Detect GPU type for hardware acceleration
     let gpu_type = detect_gpu_type(&ffmpeg_path).await;
     let encoder_config = get_encoder_config(gpu_type, &settings.output_format_video);
 
     if encoder_config.use_gpu {
-        log::info!("Using GPU acceleration with encoder: {}", encoder_config.video_encoder);
+        eprintln!(
+            "[converter] 使用 GPU 加速，编码器：{}",
+            encoder_config.video_encoder
+        );
     } else {
-        log::info!("Using CPU encoding with encoder: {}", encoder_config.video_encoder);
+        eprintln!(
+            "[converter] 使用 CPU 编码，编码器：{}",
+            encoder_config.video_encoder
+        );
     }
 
     // Convert files with concurrency
@@ -303,7 +315,25 @@ pub async fn convert_files(
     let mut handles = Vec::new();
 
     for (index, file) in files.into_iter().enumerate() {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        // 安全获取信号量许可，避免 unwrap() 导致 panic
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[converter] 错误：无法获取信号量许可，文件 {}: {}. 跳过此文件。",
+                    file.path, e
+                );
+                // 记录跳过的文件信息
+                let error_result = ConversionResult {
+                    file_id: file.id.clone(),
+                    success: false,
+                    output_path: None,
+                    error: Some(format!("信号量获取失败：{}", e)),
+                };
+                results.push(error_result);
+                continue;
+            }
+        };
         let app_clone = app.clone();
         let ffmpeg_path_clone = ffmpeg_path.clone();
         let output_dir_clone = output_dir.clone();
@@ -320,6 +350,10 @@ pub async fn convert_files(
 
             let progress_info = ProgressInfo {
                 current_index,
+                completed_count: {
+                    let count = state_clone.completed_count.lock().await;
+                    *count
+                },
                 total_count: total_count_clone,
                 start_time: start_time_clone,
             };
@@ -344,8 +378,24 @@ pub async fn convert_files(
     }
 
     for handle in handles {
-        if let Ok(result) = handle.await {
-            results.push(result);
+        match handle.await {
+            Ok(result) => {
+                results.push(result);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[converter] 错误：任务执行失败 (任务 panic 或被取消): {}",
+                    e
+                );
+                // 添加一个空的错误结果以保持索引一致性
+                let error_result = ConversionResult {
+                    file_id: String::new(),
+                    success: false,
+                    output_path: None,
+                    error: Some(format!("任务执行失败：{}", e)),
+                };
+                results.push(error_result);
+            }
         }
     }
 
@@ -389,24 +439,34 @@ async fn convert_single_file(
     // Build output path with optimization: skip single subfolder level
     let output_path = if let Some(rel_dir) = relative_dir {
         // Optimize directory structure: skip single subfolder level
-        let optimized_dir = optimize_directory_structure(rel_dir, base_dir);
+        let optimized_dir = crate::do_simplify_output_path(rel_dir);
         let sub_dir = Path::new(output_dir).join(&optimized_dir);
         if let Err(e) = std::fs::create_dir_all(&sub_dir) {
-            log::warn!("Failed to create subdirectory: {}", e);
+            eprintln!("[converter] 警告：无法创建子目录：{}", e);
         }
         sub_dir.join(format!("{}.{}", output_name, output_ext))
     } else {
         Path::new(output_dir).join(format!("{}.{}", output_name, output_ext))
     };
 
-    let output_path_str = output_path.to_string_lossy().to_string();
+    let mut output_path_str = output_path.to_string_lossy().to_string();
+    // Remove Windows NT path prefix (\\?\) if present
+    output_path_str = output_path_str
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&output_path_str)
+        .to_string();
 
     // Calculate elapsed and remaining time
+    let realtime_completed = {
+        let count = state.completed_count.lock().await;
+        *count
+    };
     let (elapsed_time, remaining_time) = calculate_time_stats(
         progress_info.start_time,
         progress_info.current_index,
         progress_info.total_count,
         0.0,
+        realtime_completed,
     );
 
     // Emit progress start with performance metrics
@@ -418,6 +478,7 @@ async fn convert_single_file(
             progress: 0.0,
             status: "starting".to_string(),
             current_index: progress_info.current_index,
+            completed_count: progress_info.completed_count,
             total_count: progress_info.total_count,
             elapsed_time,
             remaining_time,
@@ -474,81 +535,63 @@ async fn convert_single_file(
     }
 
     // Check if we need to merge video and audio
-    if file.file_type == "video" && file.has_audio.unwrap_or(false) {
-        // Get parent directory and check for audio.m4s
-        if let Some(parent) = Path::new(&file.path).parent() {
-            let audio_path = parent.join("audio.m4s");
-            if audio_path.exists() {
-                // Merge video and audio
-                cmd.arg("-i")
-                    .arg(&file.path)
-                    .arg("-i")
-                    .arg(&audio_path)
-                    .arg("-c:v").arg("copy")
-                    .arg("-c:a").arg("aac")
-                    .arg("-y")
-                    .arg("-progress")
-                    .arg("pipe:2")
-                    .arg("-nostats")
-                    .arg(&output_path_str);
-            } else {
-                cmd.arg("-i")
-                    .arg(&file.path)
-                    .arg("-y")
-                    .arg("-progress")
-                    .arg("pipe:2")
-                    .arg("-nostats");
-            }
-        } else {
-            cmd.arg("-i")
-                .arg(&file.path)
-                .arg("-y")
-                .arg("-progress")
-                .arg("pipe:2")
-                .arg("-nostats");
-        }
-    } else {
+    let merge_audio = file.file_type == "video"
+        && file.has_audio.unwrap_or(false)
+        && Path::new(&file.path)
+            .parent()
+            .map_or(false, |p| p.join("audio.m4s").exists());
+
+    if merge_audio {
+        let audio_path = Path::new(&file.path).parent().unwrap().join("audio.m4s");
         cmd.arg("-i")
             .arg(&file.path)
-            .arg("-y")
-            .arg("-progress")
-            .arg("pipe:2")
-            .arg("-nostats");
+            .arg("-i")
+            .arg(&audio_path);
+    } else {
+        cmd.arg("-i").arg(&file.path);
     }
 
-    // Add format-specific options - use GPU encoder if available
+    cmd.arg("-y")
+        .arg("-progress")
+        .arg("pipe:2")
+        .arg("-nostats");
+
+    // Add format-specific options
     if file.file_type == "video" {
-        match output_ext.as_str() {
-            "mp4" | "mkv" => {
-                // Use GPU encoder if available, otherwise use CPU
-                cmd.arg("-c:v").arg(encoder_config.video_encoder);
-                if encoder_config.use_gpu {
-                    // GPU encoding: use quality preset
-                    cmd.arg("-preset").arg("p4");
-                    cmd.arg("-cq").arg("23");
-                } else {
-                    // CPU encoding fallback
-                    cmd.arg("-preset").arg("medium");
-                    cmd.arg("-crf").arg("23");
+        if merge_audio {
+            // Merged video+audio: copy video stream directly (no re-encode), encode audio to aac
+            cmd.arg("-c:v").arg("copy");
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-b:a").arg("128k");
+        } else {
+            match output_ext.as_str() {
+                "mp4" | "mkv" => {
+                    cmd.arg("-c:v").arg(encoder_config.video_encoder);
+                    if encoder_config.use_gpu {
+                        cmd.arg("-preset").arg("p4");
+                        cmd.arg("-cq").arg("23");
+                    } else {
+                        cmd.arg("-preset").arg("medium");
+                        cmd.arg("-crf").arg("23");
+                    }
+                    cmd.arg("-c:a").arg(encoder_config.audio_encoder);
+                    cmd.arg("-b:a").arg("128k");
                 }
-                cmd.arg("-c:a").arg(encoder_config.audio_encoder);
-                cmd.arg("-b:a").arg("128k");
-            }
-            "avi" => {
-                cmd.arg("-c:v").arg(encoder_config.video_encoder);
-                if encoder_config.use_gpu {
-                    cmd.arg("-preset").arg("p4");
-                    cmd.arg("-cq").arg("23");
-                } else {
-                    cmd.arg("-preset").arg("medium");
-                    cmd.arg("-crf").arg("23");
+                "avi" => {
+                    cmd.arg("-c:v").arg(encoder_config.video_encoder);
+                    if encoder_config.use_gpu {
+                        cmd.arg("-preset").arg("p4");
+                        cmd.arg("-cq").arg("23");
+                    } else {
+                        cmd.arg("-preset").arg("medium");
+                        cmd.arg("-crf").arg("23");
+                    }
+                    cmd.arg("-c:a").arg("mp3");
                 }
-                cmd.arg("-c:a").arg("mp3");
+                _ => {}
             }
-            _ => {}
         }
     } else {
-        // Audio
         match output_ext.as_str() {
             "mp3" => {
                 cmd.arg("-vn");
@@ -576,13 +619,15 @@ async fn convert_single_file(
     // Validate output path to prevent writing outside intended directory
     let output_path_obj = Path::new(&output_path_str);
     let output_dir_obj = Path::new(output_dir);
-    
+
     // Check if the output path is within the intended output directory
     match output_path_obj.canonicalize() {
         Ok(canonical_output) => {
-            let canonical_dir = output_dir_obj.canonicalize().unwrap_or_else(|_| output_dir_obj.to_path_buf());
+            let canonical_dir = output_dir_obj
+                .canonicalize()
+                .unwrap_or_else(|_| output_dir_obj.to_path_buf());
             if !canonical_output.starts_with(&canonical_dir) {
-                log::error!("Output path outside of output directory: {}", output_path_str);
+                log::error!(target: "converter", "Output path outside of output directory: {}", output_path_str);
                 return ConversionResult {
                     file_id: file.id.clone(),
                     success: false,
@@ -597,19 +642,23 @@ async fn convert_single_file(
             if let Some(parent) = output_path_obj.parent() {
                 match parent.canonicalize() {
                     Ok(canonical_parent) => {
-                        let canonical_dir = output_dir_obj.canonicalize().unwrap_or_else(|_| output_dir_obj.to_path_buf());
+                        let canonical_dir = output_dir_obj
+                            .canonicalize()
+                            .unwrap_or_else(|_| output_dir_obj.to_path_buf());
                         if !canonical_parent.starts_with(&canonical_dir) {
-                            log::error!("Output parent path outside of output directory: {}", output_path_str);
+                            log::error!(target: "converter", "Output parent path outside of output directory: {}", output_path_str);
                             return ConversionResult {
                                 file_id: file.id.clone(),
                                 success: false,
                                 output_path: None,
-                                error: Some("Invalid output path: path traversal detected".to_string()),
+                                error: Some(
+                                    "Invalid output path: path traversal detected".to_string(),
+                                ),
                             };
                         }
                     }
                     Err(e) => {
-                        log::error!("Failed to validate output path: {}", e);
+                        log::error!(target: "converter", "Failed to validate output path: {}", e);
                         return ConversionResult {
                             file_id: file.id.clone(),
                             success: false,
@@ -622,12 +671,12 @@ async fn convert_single_file(
         }
     }
 
-    log::info!("Converting: {} -> {}", file.path, output_path_str);
+    log::info!(target: "converter", "Converting: {} -> {}", file.path, output_path_str);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            log::error!("Failed to spawn FFmpeg: {}", e);
+            log::error!(target: "converter", "Failed to spawn FFmpeg: {}", e);
             return ConversionResult {
                 file_id: file.id.clone(),
                 success: false,
@@ -653,11 +702,16 @@ async fn convert_single_file(
             // FFmpeg progress format: "progress=XX" or contains percentage
             if let Some(caps) = PERCENT_PATTERN.captures(&line) {
                 if let Ok(progress) = caps[1].parse::<f64>() {
+                    let realtime_completed = {
+                        let count = state.completed_count.lock().await;
+                        *count
+                    };
                     let (elapsed_time, remaining_time) = calculate_time_stats(
                         progress_info.start_time,
                         progress_info.current_index,
                         progress_info.total_count,
                         progress,
+                        realtime_completed,
                     );
 
                     // Calculate performance metrics
@@ -668,9 +722,16 @@ async fn convert_single_file(
                     } else {
                         0.0
                     };
-                    let total_elapsed = if elapsed_time > 0 { elapsed_time as f64 } else { 1.0 };
+                    let total_elapsed = if elapsed_time > 0 {
+                        elapsed_time as f64
+                    } else {
+                        1.0
+                    };
                     let average_speed = file_size / (1024.0 * 1024.0) / total_elapsed;
-
+                    let realtime_completed = {
+                        let count = state.completed_count.lock().await;
+                        *count
+                    };
                     let _ = app_clone.emit(
                         "conversion-progress",
                         ConversionProgress {
@@ -679,6 +740,7 @@ async fn convert_single_file(
                             progress,
                             status: "converting".to_string(),
                             current_index: progress_info.current_index,
+                            completed_count: realtime_completed,
                             total_count: progress_info.total_count,
                             elapsed_time,
                             remaining_time,
@@ -699,19 +761,37 @@ async fn convert_single_file(
     }
 
     // Calculate final time stats
+    let realtime_completed = {
+        let count = state.completed_count.lock().await;
+        *count
+    };
     let (elapsed_time, remaining_time) = calculate_time_stats(
         progress_info.start_time,
         progress_info.current_index,
         progress_info.total_count,
         100.0,
+        realtime_completed,
     );
     let file_size = file.size as f64;
-    let conversion_speed = if elapsed_time > 0 { file_size / (1024.0 * 1024.0) / elapsed_time as f64 } else { 0.0 };
+    let conversion_speed = if elapsed_time > 0 {
+        file_size / (1024.0 * 1024.0) / elapsed_time as f64
+    } else {
+        0.0
+    };
 
     // Wait for completion
     let result = match child.wait().await {
         Ok(status) => {
             if status.success() {
+                {
+                    let mut count = state.completed_count.lock().await;
+                    *count += 1;
+                }
+                // 获取更新后的已完成数量
+                let completed_after = {
+                    let count = state.completed_count.lock().await;
+                    *count
+                };
                 let _ = app.emit(
                     "conversion-progress",
                     ConversionProgress {
@@ -720,6 +800,7 @@ async fn convert_single_file(
                         progress: 100.0,
                         status: "completed".to_string(),
                         current_index: progress_info.current_index,
+                        completed_count: completed_after,
                         total_count: progress_info.total_count,
                         elapsed_time,
                         remaining_time,
@@ -731,33 +812,23 @@ async fn convert_single_file(
                 );
 
                 // Increment completed count
-                {
-                    let mut count = state.completed_count.lock().await;
-                    *count += 1;
-                }
 
-                log::info!("[Conversion] Successfully converted: {} ({:.2} MB/s)", output_path_str, conversion_speed);
+                log::info!(target: "converter", "Successfully converted: {} ({:.2} MB/s)", output_path_str, conversion_speed);
 
                 // Validate file integrity after conversion
                 let validation = validate_file_integrity(&output_path_str, &file);
-                
+
                 if !validation.is_valid {
-                    log::warn!("[Conversion] Integrity validation failed for file: {}", file.id);
+                    log::warn!(target: "converter", "Integrity validation failed for file: {}", file.id);
                     for detail in &validation.validation_details {
-                        log::warn!("[Validation] {}", detail);
+                        log::warn!(target: "converter", "Validation: {}", detail);
                     }
-                    
+
                     // Still return success but emit validation result
-                    let _ = app.emit(
-                        "conversion-integrity",
-                        validation,
-                    );
+                    let _ = app.emit("conversion-integrity", validation);
                 } else {
-                    log::info!("[Conversion] Integrity validation passed for file: {}", file.id);
-                    let _ = app.emit(
-                        "conversion-integrity",
-                        validation,
-                    );
+                    log::info!(target: "converter", "Integrity validation passed for file: {}", file.id);
+                    let _ = app.emit("conversion-integrity", validation);
                 }
 
                 ConversionResult {
@@ -768,7 +839,13 @@ async fn convert_single_file(
                 }
             } else {
                 let error = format!("FFmpeg exited with status: {}", status);
-                log::error!("[Conversion] Failed: {} - {}", file.name, error);
+                // 使用更详细的错误格式，包含完整错误链信息
+                log::error!(
+                    target: "converter",
+                    "[Conversion] Failed: {} - {:#}",
+                    file.name,
+                    error
+                );
 
                 // Increment completed count (even if failed)
                 {
@@ -785,8 +862,14 @@ async fn convert_single_file(
             }
         }
         Err(e) => {
-            let error = format!("Process error: {}", e);
-            log::error!("[Conversion] Error: {} - {}", file.name, error);
+            // 使用 {:#} 格式打印完整错误链，包含堆栈信息
+            let error = format!("{:#}", e);
+            log::error!(
+                target: "converter",
+                "[Conversion] Error: {} - {:#}",
+                file.name,
+                e
+            );
 
             // Increment completed count (even if error)
             {
@@ -813,6 +896,7 @@ fn calculate_time_stats(
     current_index: usize,
     total_count: usize,
     current_file_progress: f64,
+    completed_count: usize, // 添加实时完成的文件数量参数
 ) -> (u64, u64) {
     let elapsed_time = if let Some(start) = start_time {
         start.elapsed().as_secs()
@@ -821,11 +905,15 @@ fn calculate_time_stats(
     };
 
     // Calculate overall progress percentage (0.0 to 100.0)
-    // current_index is 0-based, so we need to consider:
-    // - Files already completed: current_index
-    // - Current file progress: current_file_progress
+    // Use real-time completed_count for accurate calculation in concurrent scenario
     let overall_progress = if total_count > 0 {
-        ((current_index as f64) * 100.0 + current_file_progress) / (total_count as f64)
+        let completed_files = completed_count;
+        // Add current file's partial progress
+        let current_progress_fraction = current_file_progress / 100.0;
+        // Avoid double counting: if file is fully completed, it should already be in completed_count
+        let progress_ratio =
+            (completed_files as f64 + current_progress_fraction) / (total_count as f64);
+        progress_ratio.min(1.0) // Cap at 100%
     } else {
         0.0
     };
@@ -841,7 +929,7 @@ fn calculate_time_stats(
         let completed_files = if current_file_progress >= 100.0 {
             current_index + 1
         } else if current_index > 0 {
-            current_index  // Use completed files only
+            current_index // Use completed files only
         } else {
             0
         };
@@ -892,75 +980,6 @@ fn calculate_time_stats(
     (elapsed_time, remaining_time)
 }
 
-/// Optimize directory structure by skipping single subfolder levels
-/// Example: download/v/video.blv -> output to download/result/video.mp4 (skip "v")
-/// But: download/v1/video1/blv -> output to download/result/v1/video1.mp4 (keep structure)
-/// Extended: download/a/b/video.blv -> output to download/result/video.mp4 (skip both "a" and "b" if each has only one subfolder)
-/// IMPORTANT: Always preserve at least the first level (sub-top level directory)
-fn optimize_directory_structure(relative_dir: &Path, base_dir: &str) -> PathBuf {
-    let components: Vec<_> = relative_dir.components().collect();
-    
-    if components.is_empty() || components.len() == 1 {
-        // No subdirectory or only one level, keep as is (this IS the sub-top level)
-        return relative_dir.to_path_buf();
-    }
-
-    let base_path = Path::new(base_dir);
-    let mut result_components = components.clone();
-    let mut current_base = base_path.to_path_buf();
-
-    // Track how many levels we've processed to ensure we don't skip level 0
-    let mut level_processed = 0;
-
-    // We can skip at most 3 levels, but never level 0
-    let max_levels_to_skip = components.len().saturating_sub(1).min(3);
-
-    for _ in 0..max_levels_to_skip {
-        if result_components.is_empty() || level_processed >= result_components.len() {
-            break;
-        }
-
-        // Level 0 is the sub-top level, NEVER skip it
-        if level_processed == 0 {
-            level_processed += 1;
-            continue;
-        }
-
-        // Get the first component (current level to check)
-        let first_component = &result_components[0];
-        let check_path = current_base.join(first_component);
-        let display_name = format!("{}", first_component.as_os_str().to_string_lossy());
-
-        // Check if this directory contains only one subdirectory
-        if let Ok(entries) = std::fs::read_dir(&check_path) {
-            let subdirs: Vec<_> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-
-            // Only skip if:
-            // 1. There's exactly one subdirectory
-            // 2. We have more components after this one (to avoid empty path)
-            // 3. This is not level 0 (already checked above)
-            if subdirs.len() == 1 && result_components.len() > 1 {
-                // Skip this level: remove first component
-                result_components.remove(0);
-                current_base = check_path;
-                log::info!("Optimizing path: skipping single subfolder '{}'", display_name);
-            } else {
-                // Cannot skip this level, stop optimizing
-                break;
-            }
-        } else {
-            // Can't read directory, stop optimizing
-            break;
-        }
-
-        level_processed += 1;
-    }
-
-    result_components.iter().collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -1017,7 +1036,10 @@ mod tests {
 
 /// Validate the integrity of a converted file
 /// Checks: file existence, size, readability, and basic format validation
-pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> crate::IntegrityValidation {
+pub fn validate_file_integrity(
+    output_path: &str,
+    original_file: &MediaFile,
+) -> crate::IntegrityValidation {
     let mut validation_details: Vec<String> = Vec::new();
     let mut is_valid = true;
 
@@ -1053,7 +1075,7 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
 
     let output_size = metadata.len();
     validation_details.push(format!("输出文件大小: {} 字节", output_size));
-    
+
     // Validate file size is reasonable (not zero and not suspiciously small)
     if output_size == 0 {
         validation_details.push("文件大小为0,可能转换失败".to_string());
@@ -1076,7 +1098,7 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_lowercase();
-    
+
     match extension.as_str() {
         "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" => {
             // Video formats: check if it's not empty
@@ -1109,13 +1131,10 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
         } else {
             0.0
         };
-        
+
         if size_ratio > 50.0 {
             // More than 50% difference in audio size is suspicious
-            validation_details.push(format!(
-                "音频文件大小异常 (差异: {:.1}%)", 
-                size_ratio
-            ));
+            validation_details.push(format!("音频文件大小异常 (差异: {:.1}%)", size_ratio));
             is_valid = false;
         }
     }
@@ -1138,4 +1157,3 @@ pub fn validate_file_integrity(output_path: &str, original_file: &MediaFile) -> 
         expected_size: Some(original_file.size),
     }
 }
-

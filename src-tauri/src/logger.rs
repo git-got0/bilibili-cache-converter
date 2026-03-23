@@ -6,7 +6,8 @@
 //! - Size-based rotation (default 10MB per file)
 //! - Real-time flushing for immediate persistence
 //! - Thread-safe implementation
-
+use chrono::Local;
+use log::{LevelFilter, Log, Metadata, Record};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -25,6 +26,29 @@ pub enum LogLevel {
     Info = 2,
     Warn = 3,
     Error = 4,
+}
+
+/// 日志输出格式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LogFormat {
+    /// 纯文本格式 (默认)
+    #[default]
+    Plain,
+    /// JSON 格式，便于日志收集系统解析
+    Json,
+}
+
+/// 日志条目结构 (用于 JSON 格式序列化)
+#[derive(Debug, Clone, Serialize)]
+struct LogEntryJson {
+    timestamp: String,
+    level: String,
+    target: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
 }
 
 impl LogLevel {
@@ -69,6 +93,12 @@ pub struct LoggerConfig {
     pub include_thread_id: bool,
     /// Include source location (file:line) in logs
     pub include_location: bool,
+    /// Enable sensitive path sanitization (replace user directories with ***)
+    pub sanitize_paths: bool,
+    /// Log output format (plain text or JSON)
+    pub log_format: LogFormat,
+    /// Enable log compression for old log files (gzip)
+    pub compress_old_logs: bool,
 }
 
 impl Default for LoggerConfig {
@@ -77,9 +107,12 @@ impl Default for LoggerConfig {
             log_dir: PathBuf::from("."),
             min_level: LogLevel::Info,
             max_file_size: 10 * 1024 * 1024, // 10MB
-            max_files: 30,                    // Keep 30 days of logs
+            max_files: 30,                   // Keep 30 days of logs
             include_thread_id: true,
             include_location: true,
+            sanitize_paths: true,         // 默认启用路径脱敏
+            log_format: LogFormat::Plain, // 默认纯文本格式
+            compress_old_logs: false,     // 默认不压缩
         }
     }
 }
@@ -104,10 +137,16 @@ struct LoggerState {
     current_file_size: AtomicU64,
     total_entries: AtomicU64,
     error_count: AtomicU64,
+    /// 缓存的用户目录，用于路径脱敏
+    user_home_dir: Option<PathBuf>,
 }
-
-/// Global logger instance
 static LOGGER: Lazy<Mutex<LoggerState>> = Lazy::new(|| {
+    // 获取用户主目录用于路径脱敏
+    let user_home_dir = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(PathBuf::from);
+
     Mutex::new(LoggerState {
         config: LoggerConfig::default(),
         current_file: None,
@@ -115,8 +154,67 @@ static LOGGER: Lazy<Mutex<LoggerState>> = Lazy::new(|| {
         current_file_size: AtomicU64::new(0),
         total_entries: AtomicU64::new(0),
         error_count: AtomicU64::new(0),
+        user_home_dir,
     })
 });
+
+/// Global logger instance
+static GLOBAL_LOGGER: SimpleLogger = SimpleLogger;
+/// Wrapper for log::Log trait implementation
+struct SimpleLogger;
+
+impl Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        // Check if the log level is enabled based on our config
+        // Default to INFO level if lock fails (allow most logs through)
+        let min_level = LOGGER
+            .lock()
+            .map(|s| s.config.min_level)
+            .unwrap_or(LogLevel::Info);
+
+        let level = match metadata.level() {
+            log::Level::Trace => LogLevel::Trace,
+            log::Level::Debug => LogLevel::Debug,
+            log::Level::Info => LogLevel::Info,
+            log::Level::Warn => LogLevel::Warn,
+            log::Level::Error => LogLevel::Error,
+        };
+
+        level >= min_level
+    }
+
+    fn log(&self, record: &Record) {
+        // Convert log::Level to our LogLevel
+        let level = match record.level() {
+            log::Level::Trace => LogLevel::Trace,
+            log::Level::Debug => LogLevel::Debug,
+            log::Level::Info => LogLevel::Info,
+            log::Level::Warn => LogLevel::Warn,
+            log::Level::Error => LogLevel::Error,
+        };
+
+        // Use our internal log function
+        log_internal(
+            level,
+            record.target(),
+            &record.args().to_string(),
+            Some(&format!(
+                "{}:{}",
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0)
+            )),
+            None,
+        );
+    }
+
+    fn flush(&self) {
+        if let Ok(mut state) = LOGGER.lock() {
+            if let Some(ref mut writer) = state.current_file {
+                let _ = writer.flush();
+            }
+        }
+    }
+}
 
 /// Initialize the logger with configuration
 pub fn init_logger(config: LoggerConfig) -> Result<(), String> {
@@ -125,7 +223,9 @@ pub fn init_logger(config: LoggerConfig) -> Result<(), String> {
         return Err(format!("Failed to create log directory: {}", e));
     }
 
-    let mut state = LOGGER.lock().map_err(|e| format!("Logger lock error: {}", e))?;
+    let mut state = LOGGER
+        .lock()
+        .map_err(|e| format!("Logger lock error: {}", e))?;
     state.config = config.clone();
     state.current_file = None;
     state.current_file_date = String::new();
@@ -136,11 +236,7 @@ pub fn init_logger(config: LoggerConfig) -> Result<(), String> {
     let log_filename = format!("bilibili-converter-{}.log", today);
     let log_path = config.log_dir.join(&log_filename);
 
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(file) => {
             state.current_file = Some(BufWriter::new(file));
             state.current_file_date = today;
@@ -167,7 +263,18 @@ pub fn init_logger(config: LoggerConfig) -> Result<(), String> {
     // Clean up old log files (outside the lock to avoid potential issues)
     drop(state);
     cleanup_old_logs()?;
-
+    // ========== 新增：注册全局 logger ==========
+    // 这使得 log::info! 等宏能够使用我们的自定义 logger
+    let result = log::set_logger(&GLOBAL_LOGGER);
+    match result {
+        Ok(()) => {
+            log::set_max_level(LevelFilter::Info);
+            eprintln!("[Logger] Global logger registered successfully");
+        }
+        Err(e) => {
+            eprintln!("[Logger] Failed to register global logger: {}", e);
+        }
+    }
     Ok(())
 }
 
@@ -178,7 +285,9 @@ pub fn update_log_directory(new_dir: PathBuf) -> Result<(), String> {
         return Err(format!("Failed to create new log directory: {}", e));
     }
 
-    let mut state = LOGGER.lock().map_err(|e| format!("Logger lock error: {}", e))?;
+    let mut state = LOGGER
+        .lock()
+        .map_err(|e| format!("Logger lock error: {}", e))?;
 
     // Flush and close current file
     if let Some(ref mut writer) = state.current_file {
@@ -194,7 +303,13 @@ pub fn update_log_directory(new_dir: PathBuf) -> Result<(), String> {
     drop(state);
 
     // Log the change
-    log_internal(LogLevel::Info, "logger", &format!("Log directory changed to: {}", new_dir.display()), None, None);
+    log_internal(
+        LogLevel::Info,
+        "logger",
+        &format!("Log directory changed to: {}", new_dir.display()),
+        None,
+        None,
+    );
 
     Ok(())
 }
@@ -204,7 +319,13 @@ pub fn set_log_level(level: LogLevel) {
     if let Ok(mut state) = LOGGER.lock() {
         state.config.min_level = level;
     }
-    log_internal(LogLevel::Info, "logger", &format!("Log level changed to: {}", level.as_str()), None, None);
+    log_internal(
+        LogLevel::Info,
+        "logger",
+        &format!("Log level changed to: {}", level.as_str()),
+        None,
+        None,
+    );
 }
 
 /// Get current log level
@@ -217,12 +338,7 @@ pub fn get_log_level() -> LogLevel {
 }
 
 /// Main logging function
-pub fn log(
-    level: LogLevel,
-    target: &str,
-    message: &str,
-    location: Option<&str>,
-) {
+pub fn log(level: LogLevel, target: &str, message: &str, location: Option<&str>) {
     // Fast check: skip if below minimum level
     let min_level = get_log_level();
     if level < min_level {
@@ -266,7 +382,7 @@ fn log_internal(
     }
 }
 
-/// Format a log entry
+/// Format a log entry (supports both plain text and JSON formats)
 fn format_log_entry(
     timestamp: &str,
     level: LogLevel,
@@ -275,24 +391,56 @@ fn format_log_entry(
     location: Option<&str>,
     thread_id: Option<u64>,
 ) -> String {
-    let mut entry = format!("[{}] [{:5}] [{}]", timestamp, level.as_str(), target);
+    // 获取配置以确定日志格式
+    let (log_format, sanitize_paths) = {
+        if let Ok(state) = LOGGER.lock() {
+            (state.config.log_format, state.config.sanitize_paths)
+        } else {
+            (LogFormat::Plain, true)
+        }
+    };
 
-    if let Some(tid) = thread_id {
-        entry.push_str(&format!(" [T{}]", tid));
+    match log_format {
+        LogFormat::Json => format_log_entry_json(
+            timestamp,
+            level,
+            target,
+            message,
+            location,
+            thread_id,
+            sanitize_paths,
+        ),
+        LogFormat::Plain => {
+            // 纯文本格式：敏感路径脱敏
+            let final_message = if sanitize_paths {
+                sanitize_path(message)
+            } else {
+                message.to_string()
+            };
+
+            let mut entry = format!("[{}] [{:5}] [{}]", timestamp, level.as_str(), target);
+
+            if let Some(tid) = thread_id {
+                entry.push_str(&format!(" [T{}]", tid));
+            }
+
+            if let Some(loc) = location {
+                entry.push_str(&format!(" [{}]", loc));
+            }
+
+            // 使用引用避免所有权问题
+            entry.push_str(&format!(" {}", final_message.as_str()));
+
+            entry
+        }
     }
-
-    if let Some(loc) = location {
-        entry.push_str(&format!(" [{}]", loc));
-    }
-
-    entry.push_str(&format!(" {}", message));
-
-    entry
 }
 
 /// Write log entry to file with rotation
 fn write_to_file(entry: &str, level: LogLevel) -> Result<(), String> {
-    let mut state = LOGGER.lock().map_err(|e| format!("Logger lock error: {}", e))?;
+    let mut state = LOGGER
+        .lock()
+        .map_err(|e| format!("Logger lock error: {}", e))?;
 
     // Check if we need a new file (date change or size limit)
     let today = get_date_string();
@@ -346,7 +494,9 @@ fn write_to_file(entry: &str, level: LogLevel) -> Result<(), String> {
         }
 
         // Update size
-        state.current_file_size.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        state
+            .current_file_size
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
     }
 
     // Update counters
@@ -384,28 +534,38 @@ fn find_next_sequence(log_dir: &PathBuf, date: &str) -> usize {
     max_seq
 }
 
-/// Clean up old log files
+/// Clean up old log files (with optional compression)
 fn cleanup_old_logs() -> Result<(), String> {
-    let state = LOGGER.lock().map_err(|e| format!("Logger lock error: {}", e))?;
-    let max_files = state.config.max_files;
-    let log_dir = state.config.log_dir.clone();
-    drop(state);
+    let (max_files, log_dir, compress_old_logs) = {
+        let state = LOGGER
+            .lock()
+            .map_err(|e| format!("Logger lock error: {}", e))?;
+        (
+            state.config.max_files,
+            state.config.log_dir.clone(),
+            state.config.compress_old_logs,
+        )
+    };
 
-    if max_files == 0 {
-        return Ok(()); // Unlimited files
+    if max_files == 0 && !compress_old_logs {
+        return Ok(()); // Unlimited files and no compression needed
     }
 
-    let mut log_files: Vec<(String, std::time::SystemTime)> = Vec::new();
+    let mut log_files: Vec<(String, std::time::SystemTime, bool)> = Vec::new();
 
     if let Ok(entries) = fs::read_dir(&log_dir) {
         for entry in entries.flatten() {
             let filename = entry.file_name().to_string_lossy().to_string();
 
-            // Only match our log files
-            if filename.starts_with("bilibili-converter-") && filename.ends_with(".log") {
+            // Match our log files (both .log and .log.gz)
+            let is_gz = filename.ends_with(".log.gz");
+            let is_plain_log =
+                filename.starts_with("bilibili-converter-") && filename.ends_with(".log");
+
+            if is_gz || is_plain_log {
                 if let Ok(metadata) = entry.metadata() {
                     if let Ok(modified) = metadata.modified() {
-                        log_files.push((filename, modified));
+                        log_files.push((filename, modified, is_gz));
                     }
                 }
             }
@@ -415,9 +575,36 @@ fn cleanup_old_logs() -> Result<(), String> {
     // Sort by modification time (newest first)
     log_files.sort_by(|a, b| b.1.cmp(&a.1));
 
-    // Delete old files
-    if log_files.len() > max_files {
-        for (filename, _) in log_files.iter().skip(max_files) {
+    // Separate plain log files from gzipped ones
+    let plain_logs: Vec<_> = log_files.iter().filter(|(_, _, is_gz)| !is_gz).collect();
+    let gzipped_logs: Vec<_> = log_files.iter().filter(|(_, _, is_gz)| *is_gz).collect();
+
+    // Compress old plain log files if enabled
+    if compress_old_logs {
+        for (filename, modified, _) in plain_logs.iter() {
+            let path = log_dir.join(filename);
+            let age_days = SystemTime::now()
+                .duration_since(*modified)
+                .map(|d| d.as_secs() / 86400)
+                .unwrap_or(0);
+
+            // 压缩超过1天的日志文件
+            if age_days >= 1 {
+                let gz_path = log_dir.join(format!("{}.gz", filename));
+                if !gz_path.exists() {
+                    if let Err(e) = compress_log_file(&path, &gz_path) {
+                        eprintln!("[LOGGER WARN] Failed to compress log {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete old files (count only plain logs + gzipped logs together for max_files)
+    let total_files = plain_logs.len() + gzipped_logs.len();
+    if total_files > max_files && max_files > 0 {
+        // Keep the newest max_files
+        for (filename, _, _is_gz) in log_files.iter().skip(max_files) {
             let path = log_dir.join(filename);
             if let Err(e) = fs::remove_file(&path) {
                 eprintln!("[LOGGER WARN] Failed to delete old log {:?}: {}", path, e);
@@ -425,6 +612,43 @@ fn cleanup_old_logs() -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// 使用 gzip 压缩单个日志文件
+/// 注意: 此功能需要启用 flate2 特性 (在 Cargo.toml 中添加 flate2 依赖)
+#[cfg(feature = "flate2")]
+fn compress_log_file(source: &PathBuf, dest: &PathBuf) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut file = File::open(source).map_err(|e| format!("Failed to open source file: {}", e))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    // 创建 GzEncoder，将数据写入 encoder，然后 finish 获取压缩后的数据
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&buffer).map_err(|e| format!("Failed to compress data: {}", e))?;
+    let compressed_data = encoder
+        .finish()
+        .map_err(|e| format!("Failed to finish gzip encoding: {}", e))?;
+
+    let mut dest_file =
+        File::create(dest).map_err(|e| format!("Failed to create gz file: {}", e))?;
+    dest_file
+        .write_all(&compressed_data)
+        .map_err(|e| format!("Failed to write gz file: {}", e))?;
+
+    // 压缩成功后删除原文件
+    fs::remove_file(source).map_err(|e| format!("Failed to delete original file: {}", e))?;
+
+    Ok(())
+}
+
+/// 不使用压缩功能时的存根实现
+#[cfg(not(feature = "flate2"))]
+fn compress_log_file(_source: &PathBuf, _dest: &PathBuf) -> Result<(), String> {
+    // 如果没有启用压缩功能，直接返回成功（不压缩）
     Ok(())
 }
 
@@ -464,93 +688,94 @@ pub struct LoggerStats {
 
 /// Get current date string in YYYY-MM-DD format (for log filenames)
 fn get_date_string() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let days = secs / 86400;
-
-    // Calculate year, month, day
-    let mut year = 1970;
-    let mut remaining_days = days as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let days_in_months: [i64; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1;
-    for days_in_month in days_in_months.iter() {
-        if remaining_days < *days_in_month {
-            break;
-        }
-        remaining_days -= days_in_month;
-        month += 1;
-    }
-    let day = remaining_days + 1;
-
-    format!("{:04}-{:02}-{:02}", year, month, day)
+    // Use chrono local time (东八区 for China)
+    Local::now().format("%Y-%m-%d").to_string()
 }
 
 /// Get current timestamp in YYYY-MM-DD HH:MM:SS format (for log entries)
 fn get_timestamp() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let days = secs / 86400;
-    let remaining = secs % 86400;
-    let hours = remaining / 3600;
-    let minutes = (remaining % 3600) / 60;
-    let seconds = remaining % 60;
+    // Use chrono local time (东八区 for China)
+    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
 
-    // Calculate year, month, day
-    let mut year = 1970;
-    let mut remaining_days = days as i64;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
+/// 脱敏敏感路径信息，将用户目录替换为 ***
+/// 例如: C:\Users\用户名\Documents\video.mp4 -> C:\Users\***\Documents\video.mp4
+/// 同时也会处理常见的临时目录和下载目录
+fn sanitize_path(path: &str) -> String {
+    // 获取用户目录进行脱敏
+    if let Ok(user_home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        if path.starts_with(&user_home) {
+            // 找到用户目录后的下一个路径分隔符位置
+            if let Some(pos) = path[user_home.len()..].find(['/', '\\']) {
+                let prefix = &path[..user_home.len() + pos + 1];
+                let suffix = &path[user_home.len() + pos + 1..];
+                return format!("{}***{}", prefix, suffix);
+            }
         }
-        remaining_days -= days_in_year;
-        year += 1;
     }
 
-    let days_in_months: [i64; 12] = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    // 脱敏其他常见敏感路径
+    let sensitive_patterns = [
+        ("C:\\Users\\", "C:\\Users\\***\\"),
+        ("/home/", "/home/***/"),
+        ("/Users/", "/Users/***/"),
+    ];
+
+    let mut result = path.to_string();
+    for (pattern, replacement) in sensitive_patterns {
+        if result.starts_with(pattern) && !result.contains("***") {
+            result = result.replacen(pattern, replacement, 1);
+        }
+    }
+
+    result
+}
+
+/// 格式化日志条目为 JSON 格式
+/// JSON 格式便于日志收集系统（如 ELK、 Loki）解析和分析
+fn format_log_entry_json(
+    timestamp: &str,
+    level: LogLevel,
+    target: &str,
+    message: &str,
+    location: Option<&str>,
+    thread_id: Option<u64>,
+    sanitize_paths: bool,
+) -> String {
+    // 如果启用路径脱敏，处理消息中的路径
+    let sanitized_message = if sanitize_paths {
+        sanitize_path(message)
     } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        message.to_string()
     };
 
-    let mut month = 1;
-    for days_in_month in days_in_months.iter() {
-        if remaining_days < *days_in_month {
-            break;
-        }
-        remaining_days -= days_in_month;
-        month += 1;
-    }
-    let day = remaining_days + 1;
+    // 先尝试 JSON 序列化，失败后再使用纯文本
+    let entry = LogEntryJson {
+        timestamp: timestamp.to_string(),
+        level: level.as_str().to_string(),
+        target: target.to_string(),
+        message: sanitized_message.clone(),
+        thread_id,
+        location: location.map(|s| s.to_string()),
+    };
 
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hours, minutes, seconds)
+    // 使用 serde_json 序列化
+    match serde_json::to_string(&entry) {
+        Ok(json) => json,
+        Err(_) => {
+            // JSON 序列化失败时回退到纯文本
+            format!(
+                "[{}] [{:5}] [{}] {}",
+                timestamp,
+                level.as_str(),
+                target,
+                sanitized_message
+            )
+        }
+    }
 }
 
 /// Check if a year is a leap year
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
 // ============================================================================
 // Convenience macros for logging
 // ============================================================================
