@@ -38,6 +38,7 @@ test_path_*.pdb
 .history/
 .codebuddy/
 .vscode/*
+.lingma
 !.vscode/extensions.json
 .idea
 .DS_Store
