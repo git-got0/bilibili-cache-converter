@@ -214,6 +214,7 @@ function App() {
   const [integrityValidations, setIntegrityValidations] = useState<IntegrityValidation[]>([]);
   const [fileStatuses, setFileStatuses] = useState<Record<string, FileStatus>>({});
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [showRestartConfirmDialog, setShowRestartConfirmDialog] = useState(false);
 
   // Find the minimum current_index among all converting files (for concurrent conversion)
   const getTopConvertingIndex = useCallback(() => {
@@ -325,7 +326,7 @@ function App() {
   // Auto-scroll to the top converting file (useEffect for reliability)
   useEffect(() => {
     if (topConvertingIndex === -1 || !isConverting) return;
-    
+
     // For virtual list (large file count)
     if (files.length > VIRTUAL_LIST_THRESHOLD && virtualList.virtualItems.length > 0) {
       virtualList.scrollToIndex(topConvertingIndex);
@@ -336,7 +337,6 @@ function App() {
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [topConvertingIndex, isConverting, files.length, virtualList]);
 
   // Debug: Log virtual list state
@@ -505,26 +505,72 @@ function App() {
     }
   }, [updateSettings]);
 
+  // Core function to actually start conversion
+  const doStartConversion = useCallback(
+    async (filesToConvert: MediaFile[]) => {
+      setIsConverting(true);
+      setError(null);
+      setCompleteEvent(null);
+
+      // Reset statuses for files being converted
+      const newStatuses: Record<string, FileStatus> = { ...fileStatuses };
+      filesToConvert.forEach((file) => {
+        newStatuses[file.id] = 'pending';
+      });
+      setFileStatuses(newStatuses);
+
+      try {
+        await invoke('start_conversion', { files: filesToConvert, folderPath });
+      } catch (err) {
+        console.error('Error starting conversion:', err);
+        setError('开始转换失败：' + err);
+        setIsConverting(false);
+      }
+    },
+    [folderPath, fileStatuses]
+  );
+
   const startConversion = useCallback(async () => {
     if (files.length === 0) return;
-    setIsConverting(true);
-    setError(null);
-    setCompleteEvent(null);
-    setFileStatuses({});
-    // Set initial pending status for all files
-    const initialStatuses: Record<string, FileStatus> = {};
-    files.forEach((file) => {
-      initialStatuses[file.id] = 'pending';
-    });
-    setFileStatuses(initialStatuses);
-    try {
-      await invoke('start_conversion', { files, folderPath });
-    } catch (err) {
-      console.error('Error starting conversion:', err);
-      setError('开始转换失败: ' + err);
-      setIsConverting(false);
+
+    // Check if there are completed files
+    const completedCount = Object.values(fileStatuses).filter((s) => s === 'completed').length;
+
+    if (completedCount > 0) {
+      // Show confirmation dialog
+      setShowRestartConfirmDialog(true);
+      return;
     }
-  }, [files, folderPath]);
+
+    // No completed files, start directly
+    await doStartConversion(files);
+  }, [files, fileStatuses, doStartConversion]);
+
+  // Handler for restarting all files
+  const handleRestartAll = useCallback(async () => {
+    setShowRestartConfirmDialog(false);
+    setFileStatuses({}); // Clear all statuses
+    await doStartConversion(files);
+  }, [files, doStartConversion]);
+
+  // Handler for restarting only failed files
+  const handleRestartFailedOnly = useCallback(async () => {
+    setShowRestartConfirmDialog(false);
+
+    // Find failed files
+    const failedIds = files.filter((f) => fileStatuses[f.id] === 'failed').map((f) => f.id);
+
+    if (failedIds.length === 0) return;
+
+    // Reset failed files' status to pending
+    const newStatuses = { ...fileStatuses };
+    failedIds.forEach((id) => (newStatuses[id] = 'pending'));
+    setFileStatuses(newStatuses);
+
+    // Only convert failed files
+    const failedFiles = files.filter((f) => failedIds.includes(f.id));
+    await doStartConversion(failedFiles);
+  }, [files, fileStatuses, doStartConversion]);
 
   const cancelConversion = useCallback(async () => {
     try {
@@ -833,6 +879,37 @@ function App() {
             )}
           </div>
 
+          {/* Toolbar for completed files management */}
+          {!isConverting && files.length > 0 && (
+            <div className="flex gap-2 mb-2 pb-2 border-b border-[#30363D]/50">
+              <Button
+                onClick={() => {
+                  setFileStatuses({});
+                  toast.success('已清除所有完成状态');
+                }}
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+              >
+                🗑️ 清除完成状态
+              </Button>
+              <Button
+                onClick={async () => {
+                  if (folderPath) {
+                    await scanFolder(folderPath);
+                    toast.success('已重新扫描文件夹');
+                  }
+                }}
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={!folderPath}
+              >
+                🔄 重新扫描文件夹
+              </Button>
+            </div>
+          )}
+
           <div
             ref={virtualList.parentRef}
             className="overflow-y-auto space-y-1 flex-1 min-h-[120px] max-h-[35vh]"
@@ -889,10 +966,7 @@ function App() {
             ) : (
               // Regular rendering for small file lists
               files.map((file, index) => (
-                <div
-                  key={file.id}
-                  data-file-index={index}
-                >
+                <div key={file.id} data-file-index={index}>
                   <FileItem file={file} status={fileStatuses[file.id]} />
                 </div>
               ))
@@ -1115,6 +1189,42 @@ function App() {
               查看
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Restart Confirmation Dialog */}
+      <Dialog open={showRestartConfirmDialog} onOpenChange={setShowRestartConfirmDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="w-5 h-5 text-[#F59E0B]" />
+              ⚠️ 检测到已完成的转换任务
+            </DialogTitle>
+            <DialogDescription>
+              <div className="py-4">
+                <p className="text-sm mb-3">当前文件列表中有已转换完成的文件，请选择操作:</p>
+
+                <div className="space-y-2">
+                  <Button onClick={handleRestartAll} className="w-full">
+                    🔄 重新转换所有文件 (会覆盖已有文件)
+                  </Button>
+
+                  <Button onClick={handleRestartFailedOnly} variant="outline" className="w-full">
+                    ⚡ 仅重试失败的文件 (
+                    {files.filter((f) => fileStatuses[f.id] === 'failed').length} 个)
+                  </Button>
+
+                  <Button
+                    onClick={() => setShowRestartConfirmDialog(false)}
+                    variant="ghost"
+                    className="w-full"
+                  >
+                    ❌ 取消操作
+                  </Button>
+                </div>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
         </DialogContent>
       </Dialog>
 
